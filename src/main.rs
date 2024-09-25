@@ -1,10 +1,10 @@
 use futures::sink::SinkExt;
 use futures::StreamExt;
 use lapin::{
-    options::BasicPublishOptions, BasicProperties, Channel as RabbitChannel, Connection,
-    ConnectionProperties,
+    message::Delivery, options::BasicConsumeOptions, options::BasicPublishOptions, BasicProperties,
+    Channel as RabbitChannel, Connection, ConnectionProperties,
 }; // Renaming lapin::Channel to RabbitChannel
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
@@ -32,21 +32,23 @@ struct PublishRequest {
 // Swagger configuration for the REST endpoints
 #[derive(OpenApi)]
 #[openapi(
-    paths(
-        publish_message,
-    ),
-    components(
-        schemas(PublishRequest)
-    ),
-    tags(
-        (name = "channels", description = "Channel publishing and WebSocket subscription")
-    )
+    paths(publish_message),
+    components(schemas(PublishRequest)),
+    tags((name = "channels", description = "Channel publishing and WebSocket subscription"))
 )]
 struct ApiDoc;
 
 #[tokio::main]
 async fn main() {
     let channels: Channels = Arc::new(Mutex::new(HashMap::new()));
+
+    // Start RabbitMQ consumer
+    let channels_clone = channels.clone();
+    tokio::spawn(async move {
+        if let Err(e) = consume_messages(channels_clone).await {
+            eprintln!("Error consuming messages: {:?}", e);
+        }
+    });
 
     // WebSocket endpoint to subscribe to channels
     let channels_ws = channels.clone();
@@ -131,7 +133,7 @@ async fn user_connected(ws: WebSocket, channel_name: String, channels: Channels)
     });
 }
 
-async fn connect_rabbitmq() -> Result<RabbitChannel, Box<dyn std::error::Error + Send + Sync>> {
+async fn connect_rabbitmq() -> Result<RabbitChannel, lapin::Error> {
     let addr = std::env::var("RABBITMQ_URL")
         .unwrap_or_else(|_| "amqp://user:password@localhost:5672/%2f".to_string());
 
@@ -148,7 +150,60 @@ async fn connect_rabbitmq() -> Result<RabbitChannel, Box<dyn std::error::Error +
         )
         .await?;
 
+    // Declare a queue for consuming messages
+    channel
+        .queue_declare(
+            "real-time-updates-queue",
+            Default::default(),
+            Default::default(),
+        )
+        .await?;
+
+    channel
+        .queue_bind(
+            "real-time-updates-queue",
+            "real-time-updates",
+            "",
+            Default::default(),
+            Default::default(),
+        )
+        .await?;
+
     Ok(channel)
+}
+
+// Consume messages from RabbitMQ and publish to WebSocket channels
+async fn consume_messages(channels: Channels) -> Result<(), lapin::Error> {
+    let rabbit_channel = connect_rabbitmq().await?;
+
+    let mut consumer = rabbit_channel
+        .basic_consume(
+            "real-time-updates-queue", // Queue name
+            "consumer_tag",            // Consumer tag
+            BasicConsumeOptions::default(),
+            Default::default(),
+        )
+        .await?;
+
+    while let Some(delivery) = consumer.next().await {
+        match delivery {
+            Ok(delivery) => {
+                let message = String::from_utf8_lossy(&delivery.data).to_string();
+                println!("Received message from RabbitMQ: {}", message);
+
+                // Publish message to all WebSocket channels
+                let channels_lock = channels.lock().await;
+                for channel in channels_lock.values() {
+                    let _ = channel.tx.send(message.clone());
+                }
+            }
+            Err(e) => {
+                eprintln!("Error receiving message: {:?}", e);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // Publish a message to RabbitMQ and to a channel using the REST endpoint
@@ -171,7 +226,7 @@ async fn publish_message(
 ) -> Result<impl warp::Reply, warp::Rejection> {
     let mut channels_lock = channels.lock().await;
     if let Some(channel) = channels_lock.get(&channel_name) {
-        let _ = channel.tx.send(publish_request.message.clone());
+        // let _ = channel.tx.send(publish_request.message.clone());
 
         // Publish the message to RabbitMQ
         if let Ok(rabbit_channel) = connect_rabbitmq().await {
@@ -194,7 +249,7 @@ async fn publish_message(
                 }
             }
         } else {
-            println!("unable to get rabbit mq")
+            println!("Unable to connect to RabbitMQ");
         }
 
         Ok(warp::reply::json(&"Message sent"))

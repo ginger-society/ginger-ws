@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebSocket Subscription Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+        }
+
+        #messages {
+            margin-top: 20px;
+            border: 1px solid #ddd;
+            padding: 10px;
+            max-width: 600px;
+            height: 300px;
+            overflow-y: auto;
+            background-color: #f9f9f9;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>WebSocket Subscription Test</h1>
+    <p>Messages received from the WebSocket will appear below:</p>
+
+    <div id="messages"></div>
+
+    <script>
+        // Create a WebSocket connection to the channel
+        const ws = new WebSocket('ws://localhost:3030/ws/my_channel');
+
+        // Log WebSocket connection status
+        ws.onopen = () => {
+            console.log('WebSocket connection established.');
+            const messagesDiv = document.getElementById('messages');
+            messagesDiv.innerHTML += '<p><em>Connected to WebSocket.</em></p>';
+        };
+
+        // Handle incoming messages from the WebSocket
+        ws.onmessage = (event) => {
+            const messagesDiv = document.getElementById('messages');
+            messagesDiv.innerHTML += '<p>' + event.data + '</p>';
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;  // Auto-scroll to the bottom
+        };
+
+        // Handle WebSocket errors
+        ws.onerror = (error) => {
+            console.error('WebSocket error:', error);
+        };
+
+        // Log when the WebSocket connection is closed
+        ws.onclose = () => {
+            console.log('WebSocket connection closed.');
+            const messagesDiv = document.getElementById('messages');
+            messagesDiv.innerHTML += '<p><em>WebSocket connection closed.</em></p>';
+        };
+    </script>
+</body>
+
+</html>

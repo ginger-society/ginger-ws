@@ -1,10 +1,11 @@
 use futures::sink::SinkExt;
 use futures::StreamExt;
 use lapin::{
-    message::Delivery, options::BasicConsumeOptions, options::BasicPublishOptions, BasicProperties,
-    Channel as RabbitChannel, Connection, ConnectionProperties,
+    message::Delivery,
+    options::{BasicAckOptions, BasicConsumeOptions, BasicPublishOptions},
+    BasicProperties, Channel as RabbitChannel, Connection, ConnectionProperties,
 }; // Renaming lapin::Channel to RabbitChannel
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
@@ -24,8 +25,14 @@ struct Channel {
 
 type Channels = Arc<Mutex<HashMap<String, Channel>>>;
 
-#[derive(Deserialize, ToSchema)]
+#[derive(Deserialize, Serialize, ToSchema)]
 struct PublishRequest {
+    message: String, // Only the message is in the body
+}
+
+#[derive(Deserialize, Serialize)]
+struct RabbitMessage {
+    channel_id: String,
     message: String,
 }
 
@@ -172,7 +179,6 @@ async fn connect_rabbitmq() -> Result<RabbitChannel, lapin::Error> {
     Ok(channel)
 }
 
-// Consume messages from RabbitMQ and publish to WebSocket channels
 async fn consume_messages(channels: Channels) -> Result<(), lapin::Error> {
     let rabbit_channel = connect_rabbitmq().await?;
 
@@ -191,10 +197,26 @@ async fn consume_messages(channels: Channels) -> Result<(), lapin::Error> {
                 let message = String::from_utf8_lossy(&delivery.data).to_string();
                 println!("Received message from RabbitMQ: {}", message);
 
-                // Publish message to all WebSocket channels
-                let channels_lock = channels.lock().await;
-                for channel in channels_lock.values() {
-                    let _ = channel.tx.send(message.clone());
+                // Deserialize the message to extract `channel_id` and `message`
+                if let Ok(rabbit_message) = serde_json::from_str::<RabbitMessage>(&message) {
+                    let channels_lock = channels.lock().await;
+
+                    // Check if the `channel_id` exists in the WebSocket channels
+                    if let Some(channel) = channels_lock.get(&rabbit_message.channel_id) {
+                        let _ = channel.tx.send(rabbit_message.message.clone());
+
+                        // Acknowledge the RabbitMQ message after sending it to WebSocket
+                        if let Err(e) = delivery.ack(BasicAckOptions::default()).await {
+                            eprintln!("Failed to acknowledge message: {:?}", e);
+                        }
+                    } else {
+                        println!(
+                            "Received message for non-existent channel: {}",
+                            rabbit_message.channel_id
+                        );
+                    }
+                } else {
+                    println!("Failed to deserialize message from RabbitMQ");
                 }
             }
             Err(e) => {
@@ -206,7 +228,6 @@ async fn consume_messages(channels: Channels) -> Result<(), lapin::Error> {
     Ok(())
 }
 
-// Publish a message to RabbitMQ and to a channel using the REST endpoint
 #[utoipa::path(
     post,
     path = "/channels/{channel_name}/publish",
@@ -222,40 +243,38 @@ async fn consume_messages(channels: Channels) -> Result<(), lapin::Error> {
 async fn publish_message(
     channel_name: String,
     publish_request: PublishRequest,
-    channels: Channels,
+    _channels: Channels,
 ) -> Result<impl warp::Reply, warp::Rejection> {
-    let mut channels_lock = channels.lock().await;
-    if let Some(channel) = channels_lock.get(&channel_name) {
-        // let _ = channel.tx.send(publish_request.message.clone());
+    if let Ok(rabbit_channel) = connect_rabbitmq().await {
+        // let payload = publish_request.message.clone().into_bytes();
 
-        // Publish the message to RabbitMQ
-        if let Ok(rabbit_channel) = connect_rabbitmq().await {
-            let payload = publish_request.message.clone().into_bytes();
-            match rabbit_channel
-                .basic_publish(
-                    "real-time-updates", // Exchange name
-                    "",                  // Routing key
-                    BasicPublishOptions::default(),
-                    &payload,
-                    BasicProperties::default(),
-                )
-                .await
-            {
-                Ok(_) => {
-                    println!("Message successfully sent to RabbitMQ");
-                }
-                Err(e) => {
-                    println!("Failed to send message to RabbitMQ: {:?}", e);
-                }
+        let rabbit_message = RabbitMessage {
+            channel_id: channel_name.clone(), // channel_id from the path
+            message: publish_request.message.clone(),
+        };
+
+        match rabbit_channel
+            .basic_publish(
+                "real-time-updates", // Exchange name
+                "",                  // Routing key
+                BasicPublishOptions::default(),
+                &serde_json::to_string(&rabbit_message).unwrap().into_bytes(),
+                BasicProperties::default(),
+            )
+            .await
+        {
+            Ok(_) => {
+                println!("Message successfully sent to RabbitMQ");
+                Ok(warp::reply::json(&"Message sent"))
             }
-        } else {
-            println!("Unable to connect to RabbitMQ");
+            Err(e) => {
+                println!("Failed to send message to RabbitMQ: {:?}", e);
+                Ok(warp::reply::json(&"Failed to send message to RabbitMQ"))
+            }
         }
-
-        Ok(warp::reply::json(&"Message sent"))
     } else {
-        println!("Channel '{}' not found", channel_name);
-        Ok(warp::reply::json(&"Channel not found"))
+        println!("Unable to connect to RabbitMQ");
+        Ok(warp::reply::json(&"Unable to connect to RabbitMQ"))
     }
 }
 

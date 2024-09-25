@@ -1,11 +1,17 @@
 use futures::sink::SinkExt;
-use futures::{FutureExt, StreamExt};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use warp::ws::{Message, WebSocket};
-use warp::Filter; // Add this to bring the `send` method into scope
+use warp::Filter;
+
+use utoipa::{
+    openapi::security::{ApiKey, ApiKeyValue, SecurityScheme},
+    Modify, OpenApi, ToSchema,
+};
+use utoipa_swagger_ui::Config;
 
 #[derive(Debug, Clone)]
 struct Channel {
@@ -15,10 +21,25 @@ struct Channel {
 
 type Channels = Arc<Mutex<HashMap<String, Channel>>>;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct PublishRequest {
     message: String,
 }
+
+// Swagger configuration for the REST endpoints
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        publish_message,
+    ),
+    components(
+        schemas(PublishRequest)
+    ),
+    tags(
+        (name = "channels", description = "Channel publishing and WebSocket subscription")
+    )
+)]
+struct ApiDoc;
 
 #[tokio::main]
 async fn main() {
@@ -42,7 +63,22 @@ async fn main() {
         .and(with_channels(channels_rest))
         .and_then(publish_message);
 
-    let routes = websocket_route.or(publish_route);
+    // Serve OpenAPI spec
+    let api_doc = warp::path("api-doc.json")
+        .and(warp::get())
+        .map(|| warp::reply::json(&ApiDoc::openapi()));
+
+    // Serve Swagger UI
+    let config = Arc::new(Config::from("/api-doc.json"));
+    let swagger_ui = warp::path("swagger-ui")
+        .and(warp::get())
+        .and(warp::path::full())
+        .and(warp::path::tail())
+        .and(warp::any().map(move || config.clone()))
+        .and_then(serve_swagger);
+
+    // Combine all routes
+    let routes = websocket_route.or(publish_route).or(api_doc).or(swagger_ui);
 
     warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
 }
@@ -63,42 +99,29 @@ async fn user_connected(ws: WebSocket, channel_name: String, channels: Channels)
         let channel = channels_lock
             .entry(channel_name.clone())
             .or_insert_with(|| {
-                let (tx, _) = broadcast::channel(100); // Create a new broadcast channel
+                let (tx, _) = broadcast::channel(100);
                 Channel {
                     name: channel_name.clone(),
-                    tx, // Insert the sender part of the channel into the struct
+                    tx,
                 }
             });
 
-        // Clone the channel's tx (sender) and create a new receiver for the WebSocket
         (channel.tx.clone(), channel.tx.subscribe())
     };
 
-    // Spawn task to send incoming WebSocket messages to the channel
     tokio::spawn(async move {
         while let Some(result) = rx.next().await {
-            match result {
-                Ok(msg) => {
-                    if let Ok(text) = msg.to_str() {
-                        // Send the message to all subscribers in the channel
-                        if let Err(_) = channel_tx.send(text.to_string()) {
-                            eprintln!("Error sending message to channel");
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("WebSocket error: {}", e);
-                    break;
+            if let Ok(msg) = result {
+                if let Ok(text) = msg.to_str() {
+                    let _ = channel_tx.send(text.to_string());
                 }
             }
         }
     });
 
-    // Spawn task to forward messages from the channel to the WebSocket client
     tokio::spawn(async move {
         while let Ok(message) = channel_rx.recv().await {
             if tx.send(Message::text(message)).await.is_err() {
-                eprintln!("WebSocket send error");
                 break;
             }
         }
@@ -106,6 +129,18 @@ async fn user_connected(ws: WebSocket, channel_name: String, channels: Channels)
 }
 
 // Publish a message to a channel using the REST endpoint
+#[utoipa::path(
+    post,
+    path = "/channels/{channel_name}/publish",
+    params(
+        ("channel_name" = String, Path, description = "The name of the channel to publish to")
+    ),
+    request_body = PublishRequest,
+    responses(
+        (status = 200, description = "Message sent"),
+        (status = 404, description = "Channel not found")
+    )
+)]
 async fn publish_message(
     channel_name: String,
     publish_request: PublishRequest,
@@ -117,5 +152,38 @@ async fn publish_message(
         Ok(warp::reply::json(&"Message sent"))
     } else {
         Ok(warp::reply::json(&"Channel not found"))
+    }
+}
+
+// Serve Swagger UI assets
+async fn serve_swagger(
+    full_path: warp::path::FullPath,
+    tail: warp::path::Tail,
+    config: Arc<Config<'static>>,
+) -> Result<Box<dyn warp::Reply + 'static>, warp::Rejection> {
+    if full_path.as_str() == "/swagger-ui" {
+        return Ok(Box::new(warp::redirect::found(
+            warp::http::Uri::from_static("/swagger-ui/"),
+        )));
+    }
+
+    let path = tail.as_str();
+    match utoipa_swagger_ui::serve(path, config) {
+        Ok(file) => {
+            if let Some(file) = file {
+                Ok(Box::new(
+                    warp::http::Response::builder()
+                        .header("Content-Type", file.content_type)
+                        .body(file.bytes),
+                ))
+            } else {
+                Ok(Box::new(warp::http::StatusCode::NOT_FOUND))
+            }
+        }
+        Err(error) => Ok(Box::new(
+            warp::http::Response::builder()
+                .status(warp::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .body(error.to_string()),
+        )),
     }
 }

@@ -1,17 +1,20 @@
 use futures::sink::SinkExt;
 use futures::StreamExt;
+use lapin::{
+    options::BasicPublishOptions, BasicProperties, Channel as RabbitChannel, Connection,
+    ConnectionProperties,
+}; // Renaming lapin::Channel to RabbitChannel
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use tokio::sync::broadcast;
-use warp::ws::{Message, WebSocket};
-use warp::Filter;
-
+use std::sync::Arc;
+use tokio::sync::{broadcast, Mutex};
 use utoipa::{
     openapi::security::{ApiKey, ApiKeyValue, SecurityScheme},
     Modify, OpenApi, ToSchema,
 };
 use utoipa_swagger_ui::Config;
+use warp::ws::{Message, WebSocket};
+use warp::Filter;
 
 #[derive(Debug, Clone)]
 struct Channel {
@@ -95,7 +98,7 @@ async fn user_connected(ws: WebSocket, channel_name: String, channels: Channels)
     let (mut tx, mut rx) = ws.split();
 
     let (channel_tx, mut channel_rx) = {
-        let mut channels_lock = channels.lock().unwrap();
+        let mut channels_lock = channels.lock().await;
         let channel = channels_lock
             .entry(channel_name.clone())
             .or_insert_with(|| {
@@ -128,7 +131,27 @@ async fn user_connected(ws: WebSocket, channel_name: String, channels: Channels)
     });
 }
 
-// Publish a message to a channel using the REST endpoint
+async fn connect_rabbitmq() -> Result<RabbitChannel, Box<dyn std::error::Error + Send + Sync>> {
+    let addr = std::env::var("RABBITMQ_URL")
+        .unwrap_or_else(|_| "amqp://user:password@localhost:5672/%2f".to_string());
+
+    let conn = Connection::connect(&addr, ConnectionProperties::default()).await?;
+    let channel = conn.create_channel().await?;
+
+    // Declare an exchange if needed
+    channel
+        .exchange_declare(
+            "real-time-updates",
+            lapin::ExchangeKind::Fanout,
+            Default::default(),
+            Default::default(),
+        )
+        .await?;
+
+    Ok(channel)
+}
+
+// Publish a message to RabbitMQ and to a channel using the REST endpoint
 #[utoipa::path(
     post,
     path = "/channels/{channel_name}/publish",
@@ -146,11 +169,37 @@ async fn publish_message(
     publish_request: PublishRequest,
     channels: Channels,
 ) -> Result<impl warp::Reply, warp::Rejection> {
-    let mut channels_lock = channels.lock().unwrap();
+    let mut channels_lock = channels.lock().await;
     if let Some(channel) = channels_lock.get(&channel_name) {
-        let _ = channel.tx.send(publish_request.message);
+        let _ = channel.tx.send(publish_request.message.clone());
+
+        // Publish the message to RabbitMQ
+        if let Ok(rabbit_channel) = connect_rabbitmq().await {
+            let payload = publish_request.message.clone().into_bytes();
+            match rabbit_channel
+                .basic_publish(
+                    "real-time-updates", // Exchange name
+                    "",                  // Routing key
+                    BasicPublishOptions::default(),
+                    &payload,
+                    BasicProperties::default(),
+                )
+                .await
+            {
+                Ok(_) => {
+                    println!("Message successfully sent to RabbitMQ");
+                }
+                Err(e) => {
+                    println!("Failed to send message to RabbitMQ: {:?}", e);
+                }
+            }
+        } else {
+            println!("unable to get rabbit mq")
+        }
+
         Ok(warp::reply::json(&"Message sent"))
     } else {
+        println!("Channel '{}' not found", channel_name);
         Ok(warp::reply::json(&"Channel not found"))
     }
 }

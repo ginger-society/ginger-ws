@@ -1,5 +1,6 @@
 use futures::sink::SinkExt;
 use futures::StreamExt;
+use jsonwebtoken::{decode, DecodingKey, Validation};
 use lapin::{
     message::Delivery,
     options::{BasicAckOptions, BasicConsumeOptions, BasicPublishOptions},
@@ -14,8 +15,11 @@ use utoipa::{
     Modify, OpenApi, ToSchema,
 };
 use utoipa_swagger_ui::Config;
-use warp::ws::{Message, WebSocket};
-use warp::Filter;
+use warp::{
+    reject::Rejection,
+    ws::{Message, WebSocket},
+};
+use warp::{reply::Reply, Filter};
 
 #[derive(Debug, Clone)]
 struct Channel {
@@ -60,14 +64,15 @@ async fn main() {
     // WebSocket endpoint to subscribe to channels
     let channels_ws = channels.clone();
     let websocket_route = warp::path("ws")
-        .and(warp::path::param::<String>())
-        .and(warp::ws())
-        .and(with_channels(channels_ws))
-        .map(|channel_name: String, ws: warp::ws::Ws, channels| {
-            ws.on_upgrade(move |socket| user_connected(socket, channel_name, channels))
-        });
+        .and(warp::path::param::<String>()) // Channel name
+        .and(warp::ws()) // WebSocket instance
+        .and(warp::header::optional("Authorization")) // Authorization header
+        .and(with_channels(channels_ws)) // Channels
+        .and_then(|channel_name, ws, auth_header, channels| {
+            user_authenticated(channel_name, ws, channels, auth_header) // Correct argument order
+        })
+        .and_then(handle_ws_upgrade); // Handle WebSocket upgrade
 
-    // REST API to publish messages to a channel
     let channels_rest = channels.clone();
     let publish_route = warp::path!("channels" / String / "publish")
         .and(warp::post())
@@ -138,6 +143,55 @@ async fn user_connected(ws: WebSocket, channel_name: String, channels: Channels)
             }
         }
     });
+}
+
+#[derive(Deserialize, Serialize)]
+struct Claims {
+    sub: String,
+    exp: usize,
+    user_id: String,
+    token_type: String, // Add token_type to distinguish between access and refresh tokens
+    client_id: String,
+}
+// Custom JWT Error
+#[derive(Debug)]
+struct JWTError;
+
+impl warp::reject::Reject for JWTError {}
+
+async fn handle_ws_upgrade(
+    (ws, channel_name, channels): (warp::ws::Ws, String, Channels),
+) -> Result<impl warp::Reply, Rejection> {
+    Ok(ws.on_upgrade(move |socket| user_connected(socket, channel_name, channels)))
+}
+
+async fn user_authenticated(
+    channel_name: String,
+    ws: warp::ws::Ws,
+    channels: Channels,
+    auth_header: Option<String>, // Extract from filter
+) -> Result<(warp::ws::Ws, String, Channels), Rejection> {
+    if let Some(auth_header) = auth_header {
+        let token = auth_header.trim_start_matches("Bearer ").trim();
+        let secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+
+        let decoding_key = DecodingKey::from_secret(secret.as_ref());
+        let validation = Validation::new(jsonwebtoken::Algorithm::HS256);
+
+        match decode::<Claims>(&token, &decoding_key, &validation) {
+            Ok(token_data) => {
+                println!("Authenticated user: {:?}", token_data.claims.user_id);
+                Ok((ws, channel_name, channels))
+            }
+            Err(_) => {
+                println!("Unauthorized access attempt");
+                Err(warp::reject::custom(JWTError))
+            }
+        }
+    } else {
+        println!("Authorization header missing");
+        Err(warp::reject::custom(JWTError))
+    }
 }
 
 async fn connect_rabbitmq() -> Result<RabbitChannel, lapin::Error> {

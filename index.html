@@ -29,34 +29,43 @@
     <div id="messages"></div>
 
     <script>
-        // Create a WebSocket connection to the channel
-        const ws = new WebSocket('ws://localhost:3030/ws/my_channel');
+        // Retrieve the access token from localStorage
+        const accessToken = localStorage.getItem('access_token');
 
-        // Log WebSocket connection status
-        ws.onopen = () => {
-            console.log('WebSocket connection established.');
-            const messagesDiv = document.getElementById('messages');
-            messagesDiv.innerHTML += '<p><em>Connected to WebSocket.</em></p>';
-        };
+        // Check if the token exists
+        if (!accessToken) {
+            console.error('Access token not found in localStorage.');
+            document.getElementById('messages').innerHTML = '<p><em>Access token not found. Please log in.</em></p>';
+        } else {
+            // Create a WebSocket connection using the access token in the subprotocol
+            const ws = new WebSocket('ws://localhost:3030/ws/my_channel', [accessToken]);
 
-        // Handle incoming messages from the WebSocket
-        ws.onmessage = (event) => {
-            const messagesDiv = document.getElementById('messages');
-            messagesDiv.innerHTML += '<p>' + event.data + '</p>';
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;  // Auto-scroll to the bottom
-        };
+            // Log WebSocket connection status
+            ws.onopen = () => {
+                console.log('WebSocket connection established.');
+                const messagesDiv = document.getElementById('messages');
+                messagesDiv.innerHTML += '<p><em>Connected to WebSocket.</em></p>';
+            };
 
-        // Handle WebSocket errors
-        ws.onerror = (error) => {
-            console.error('WebSocket error:', error);
-        };
+            // Handle incoming messages from the WebSocket
+            ws.onmessage = (event) => {
+                const messagesDiv = document.getElementById('messages');
+                messagesDiv.innerHTML += '<p>' + event.data + '</p>';
+                messagesDiv.scrollTop = messagesDiv.scrollHeight;  // Auto-scroll to the bottom
+            };
 
-        // Log when the WebSocket connection is closed
-        ws.onclose = () => {
-            console.log('WebSocket connection closed.');
-            const messagesDiv = document.getElementById('messages');
-            messagesDiv.innerHTML += '<p><em>WebSocket connection closed.</em></p>';
-        };
+            // Handle WebSocket errors
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+            };
+
+            // Log when the WebSocket connection is closed
+            ws.onclose = () => {
+                console.log('WebSocket connection closed.');
+                const messagesDiv = document.getElementById('messages');
+                messagesDiv.innerHTML += '<p><em>WebSocket connection closed.</em></p>';
+            };
+        }
     </script>
 </body>
 

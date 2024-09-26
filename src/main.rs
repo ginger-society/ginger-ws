@@ -63,14 +63,18 @@ async fn main() {
 
     // WebSocket endpoint to subscribe to channels
     let channels_ws = channels.clone();
+    // Modify the websocket_route to extract token from query parameters
     let websocket_route = warp::path("ws")
         .and(warp::path::param::<String>()) // Channel name
         .and(warp::ws()) // WebSocket instance
-        .and(warp::header::optional("Authorization")) // Authorization header
+        .and(warp::query::<HashMap<String, String>>()) // Extract query parameters
         .and(with_channels(channels_ws)) // Channels
-        .and_then(|channel_name, ws, auth_header, channels| {
-            user_authenticated(channel_name, ws, channels, auth_header) // Correct argument order
-        })
+        .and_then(
+            |channel_name, ws, query_params: HashMap<String, String>, channels| {
+                let token = query_params.get("token").cloned(); // Get token from query params
+                user_authenticated(channel_name, ws, channels, token) // Pass the token
+            },
+        )
         .and_then(handle_ws_upgrade); // Handle WebSocket upgrade
 
     let channels_rest = channels.clone();
@@ -164,16 +168,15 @@ async fn handle_ws_upgrade(
 ) -> Result<impl warp::Reply, Rejection> {
     Ok(ws.on_upgrade(move |socket| user_connected(socket, channel_name, channels)))
 }
-
 async fn user_authenticated(
     channel_name: String,
     ws: warp::ws::Ws,
     channels: Channels,
-    auth_header: Option<String>, // Extract from filter
+    token: Option<String>, // Extract token from query parameters
 ) -> Result<(warp::ws::Ws, String, Channels), Rejection> {
-    if let Some(auth_header) = auth_header {
-        let token = auth_header.trim_start_matches("Bearer ").trim();
-        let secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+    if let Some(token) = token {
+        // No need to trim "Bearer " since the token is expected to be plain
+        let secret = "1234";
 
         let decoding_key = DecodingKey::from_secret(secret.as_ref());
         let validation = Validation::new(jsonwebtoken::Algorithm::HS256);
@@ -183,13 +186,13 @@ async fn user_authenticated(
                 println!("Authenticated user: {:?}", token_data.claims.user_id);
                 Ok((ws, channel_name, channels))
             }
-            Err(_) => {
-                println!("Unauthorized access attempt");
+            Err(e) => {
+                println!("Unauthorized access attempt : {}", e);
                 Err(warp::reject::custom(JWTError))
             }
         }
     } else {
-        println!("Authorization header missing");
+        println!("Token query parameter missing");
         Err(warp::reject::custom(JWTError))
     }
 }

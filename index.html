@@ -38,7 +38,7 @@
             document.getElementById('messages').innerHTML = '<p><em>Access token not found. Please log in.</em></p>';
         } else {
             // Create a WebSocket connection using the access token in the subprotocol
-            const ws = new WebSocket('ws://localhost:3030/ws/my_channel', [accessToken]);
+            const ws = new WebSocket('ws://localhost:3030/ws/my_channel?token=' + accessToken);
 
             // Log WebSocket connection status
             ws.onopen = () => {

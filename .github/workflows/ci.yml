@@ -1,0 +1,48 @@
+name: Build, Push Docker Image, and Restart Deployment
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Set up cache for Cargo
+      uses: actions/cache@v2
+      with:
+        path: |
+          target
+          Cargo.lock
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
+    - name: Log in to Docker Hub
+      run: echo "${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" --password-stdin
+
+    - name: Build Docker image
+      run: docker build -t ${{ secrets.DOCKER_HUB_USERNAME }}/ws-service-stage:latest . --build-arg GINGER_TOKEN=${{ secrets.GINGER_TOKEN }}
+
+    - name: Push Docker image
+      run: docker push ${{ secrets.DOCKER_HUB_USERNAME }}/ws-service-stage:latest
+
+    - name: Set up Kubeconfig
+      run: |
+        mkdir -p $HOME/.kube
+        echo "${{ secrets.STAGING_K8_CONFIG }}" > $HOME/.kube/config
+
+    - name: Install kubectl
+      run: |
+        curl -LO "https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl"
+        chmod +x ./kubectl
+        sudo mv ./kubectl /usr/local/bin/kubectl
+
+    - name: Restart Kubernetes deployment
+      run: kubectl rollout restart deployment ginger-ws
+

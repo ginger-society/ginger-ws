@@ -44,5 +44,5 @@ jobs:
         sudo mv ./kubectl /usr/local/bin/kubectl
 
     - name: Restart Kubernetes deployment
-      run: kubectl rollout restart deployment ginger-ws
+      run: kubectl rollout restart deployment notification-service-deployment
 

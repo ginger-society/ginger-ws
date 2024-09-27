@@ -64,7 +64,8 @@ async fn main() {
     // WebSocket endpoint to subscribe to channels
     let channels_ws = channels.clone();
     // Modify the websocket_route to extract token from query parameters
-    let websocket_route = warp::path("ws")
+    let websocket_route = warp::path("notification")
+        .and(warp::path("ws"))
         .and(warp::path::param::<String>()) // Channel name
         .and(warp::ws()) // WebSocket instance
         .and(warp::query::<HashMap<String, String>>()) // Extract query parameters
@@ -78,20 +79,23 @@ async fn main() {
         .and_then(handle_ws_upgrade); // Handle WebSocket upgrade
 
     let channels_rest = channels.clone();
-    let publish_route = warp::path!("channels" / String / "publish")
+    let publish_route = warp::path("notification")
+        .and(warp::path!("channels" / String / "publish"))
         .and(warp::post())
         .and(warp::body::json())
         .and(with_channels(channels_rest))
         .and_then(publish_message);
 
     // Serve OpenAPI spec
-    let api_doc = warp::path("api-doc.json")
+    let api_doc = warp::path("notification")
+        .and(warp::path("api-doc.json"))
         .and(warp::get())
         .map(|| warp::reply::json(&ApiDoc::openapi()));
 
     // Serve Swagger UI
-    let config = Arc::new(Config::from("/api-doc.json"));
-    let swagger_ui = warp::path("swagger-ui")
+    let config = Arc::new(Config::from("/notification/api-doc.json"));
+    let swagger_ui = warp::path("notification")
+        .and(warp::path("swagger-ui"))
         .and(warp::get())
         .and(warp::path::full())
         .and(warp::path::tail())

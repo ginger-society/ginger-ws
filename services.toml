@@ -1,0 +1,16 @@
+dir = "."
+lang = "Rust"
+organization_id = "ginger-society"
+service_type = "RPCEndpoint"
+spec_url = "/api-doc.json"
+
+[services]
+
+[portals_refs]
+
+[urls]
+dev = "http://localhost:3030/notification"
+prod = "http://localhost:3030"
+prod_k8 = "http://localhost:3030"
+stage = "http://localhost:3030/notification"
+stage_k8 = "http://notification-service/notification"

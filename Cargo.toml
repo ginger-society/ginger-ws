@@ -1,4 +1,5 @@
 [package]
+description = "Notification service"
 edition = "2021"
 name = "ginger-ws"
 version = "0.1.0"
@@ -13,3 +14,6 @@ tokio = {version = "1", features = ["full"]}
 utoipa = {version = "2", features = ["json"]}
 utoipa-swagger-ui = "2.0"
 warp = "0.3"
+
+[package.metadata]
+organization = "ginger-society"

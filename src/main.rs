@@ -105,7 +105,7 @@ async fn main() {
     // Combine all routes
     let routes = websocket_route.or(publish_route).or(api_doc).or(swagger_ui);
 
-    warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
+    warp::serve(routes).run(([0, 0, 0, 0], 3030)).await;
 }
 
 // Filter to inject channels into the route handlers

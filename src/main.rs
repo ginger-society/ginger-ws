@@ -1,6 +1,7 @@
 use futures::sink::SinkExt;
 use futures::StreamExt;
 use jsonwebtoken::{decode, DecodingKey, Validation};
+use lapin::Error as LapinError;
 use lapin::{
     message::Delivery,
     options::{BasicAckOptions, BasicConsumeOptions, BasicPublishOptions},
@@ -10,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
+use tokio::time::{sleep, Duration};
 use utoipa::{
     openapi::security::{ApiKey, ApiKeyValue, SecurityScheme},
     Modify, OpenApi, ToSchema,
@@ -56,9 +58,8 @@ async fn main() {
     // Start RabbitMQ consumer
     let channels_clone = channels.clone();
     tokio::spawn(async move {
-        if let Err(e) = consume_messages(channels_clone).await {
-            eprintln!("Error consuming messages: {:?}", e);
-        }
+        consume_messages(channels_clone).await
+        // Ensure the block returns `()`
     });
 
     // WebSocket endpoint to subscribe to channels
@@ -240,13 +241,33 @@ async fn connect_rabbitmq() -> Result<RabbitChannel, lapin::Error> {
     Ok(channel)
 }
 
-async fn consume_messages(channels: Channels) -> Result<(), lapin::Error> {
-    let rabbit_channel = connect_rabbitmq().await?;
+async fn consume_messages(channels: Channels) {
+    loop {
+        match connect_rabbitmq().await {
+            Ok(rabbit_channel) => {
+                if let Err(e) = process_rabbitmq_messages(rabbit_channel, channels.clone()).await {
+                    eprintln!("Error processing messages: {:?}", e);
+                }
+            }
+            Err(e) => {
+                eprintln!("Error connecting to RabbitMQ: {:?}", e);
+            }
+        }
 
+        // Wait before retrying
+        eprintln!("Reconnecting to RabbitMQ in 5 seconds...");
+        sleep(Duration::from_secs(5)).await;
+    }
+}
+
+async fn process_rabbitmq_messages(
+    rabbit_channel: RabbitChannel,
+    channels: Channels,
+) -> Result<(), LapinError> {
     let mut consumer = rabbit_channel
         .basic_consume(
-            "real-time-updates-queue", // Queue name
-            "consumer_tag",            // Consumer tag
+            "real-time-updates-queue",
+            "consumer_tag",
             BasicConsumeOptions::default(),
             Default::default(),
         )
@@ -255,24 +276,18 @@ async fn consume_messages(channels: Channels) -> Result<(), lapin::Error> {
     while let Some(delivery) = consumer.next().await {
         match delivery {
             Ok(delivery) => {
+                // Handle message processing and acknowledgment
                 let message = String::from_utf8_lossy(&delivery.data).to_string();
                 println!("Received message from RabbitMQ: {}", message);
 
-                // Deserialize the message to extract `channel_id` and `message`
                 if let Ok(rabbit_message) = serde_json::from_str::<RabbitMessage>(&message) {
                     let channels_lock = channels.lock().await;
-
-                    // Check if the `channel_id` exists in the WebSocket channels
                     if let Some(channel) = channels_lock.get(&rabbit_message.channel_id) {
                         let _ = channel.tx.send(rabbit_message.message.clone());
-
-                        // Acknowledge the RabbitMQ message after sending it to WebSocket
-                        if let Err(e) = delivery.ack(BasicAckOptions::default()).await {
-                            eprintln!("Failed to acknowledge message: {:?}", e);
-                        }
+                        delivery.ack(BasicAckOptions::default()).await?;
                     } else {
                         println!(
-                            "Received message for non-existent channel: {}",
+                            "Message for non-existent channel: {}",
                             rabbit_message.channel_id
                         );
                     }
@@ -282,6 +297,7 @@ async fn consume_messages(channels: Channels) -> Result<(), lapin::Error> {
             }
             Err(e) => {
                 eprintln!("Error receiving message: {:?}", e);
+                return Err(e); // Return error to trigger reconnection
             }
         }
     }

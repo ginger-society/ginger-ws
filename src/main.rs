@@ -291,7 +291,7 @@ async fn consume_messages(channels: Channels) -> Result<(), lapin::Error> {
 
 #[utoipa::path(
     post,
-    path = "/channels/{channel_name}/publish",
+    path = "/notification/channels/{channel_name}/publish",
     params(
         ("channel_name" = String, Path, description = "The name of the channel to publish to")
     ),

@@ -23,11 +23,11 @@ RUN /app/build.sh
 FROM gingersociety/rust-rocket-api-runner:latest
 
 # Copy the compiled binary from the builder stage
-COPY --from=builder /app/target/release/ginger-ws /app/
+COPY --from=builder /app/target/release/NotificationService /app/
 
 # Set the working directory
 WORKDIR /app
 
 
 # Run the executable when the container starts
-ENTRYPOINT ["./ginger-ws"]
+ENTRYPOINT ["./NotificationService"]

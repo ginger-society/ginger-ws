@@ -15,6 +15,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "NotificationService"
+version = "0.1.0"
+dependencies = [
+ "IAMService",
+ "futures",
+ "jsonwebtoken",
+ "lapin",
+ "serde",
+ "serde_json",
+ "tokio",
+ "utoipa",
+ "utoipa-swagger-ui",
+ "warp",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -950,22 +966,6 @@ name = "gimli"
 version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32085ea23f3234fc7846555e85283ba4de91e21016dc0455a16286d87a292d64"
-
-[[package]]
-name = "ginger-ws"
-version = "0.1.0"
-dependencies = [
- "IAMService",
- "futures",
- "jsonwebtoken",
- "lapin",
- "serde",
- "serde_json",
- "tokio",
- "utoipa",
- "utoipa-swagger-ui",
- "warp",
-]
 
 [[package]]
 name = "h2"

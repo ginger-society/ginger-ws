@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 use tokio::time::{sleep, Duration};
+use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
+use utoipa::{openapi, Modify};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::Config;
 use warp::Filter;
@@ -38,14 +40,62 @@ struct RabbitMessage {
     message: String,
 }
 
+async fn authenticate_token(token: Option<String>) -> Result<Claims, warp::Rejection> {
+    if let Some(token) = token {
+        let secret = "1234"; // Use environment variable in production
+
+        let decoding_key = DecodingKey::from_secret(secret.as_ref());
+        let validation = Validation::new(jsonwebtoken::Algorithm::HS256);
+
+        match decode::<Claims>(&token, &decoding_key, &validation) {
+            Ok(token_data) => Ok(token_data.claims),
+            Err(_) => Err(warp::reject::custom(JWTError)),
+        }
+    } else {
+        Err(warp::reject::custom(JWTError))
+    }
+}
+
+fn with_auth() -> impl Filter<Extract = (Claims,), Error = warp::Rejection> + Clone {
+    warp::header::optional::<String>("Authorization").and_then(
+        |auth_header: Option<String>| async move {
+            if let Some(token) = auth_header {
+                let token = token.trim_start_matches("Bearer ").to_string();
+                authenticate_token(Some(token)).await
+            } else {
+                Err(warp::reject::custom(JWTError))
+            }
+        },
+    )
+}
+
 // Swagger configuration for the REST endpoints
 #[derive(OpenApi)]
 #[openapi(
     paths(publish_message),
-    components(schemas(PublishRequest)),
-    tags((name = "channels", description = "Channel publishing and WebSocket subscription"))
+    components(
+        schemas(PublishRequest)
+    ),
+    tags((name = "channels", description = "Channel publishing and WebSocket subscription")),
+    modifiers(&SecurityAddon),
 )]
 struct ApiDoc;
+
+struct SecurityAddon;
+impl Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        // Safely get the components
+        let components = openapi.components.as_mut().unwrap();
+
+        // Add a Bearer token security scheme globally
+        components.add_security_scheme(
+            "bearerAuth", // Name of the security scheme
+            SecurityScheme::Http(
+                Http::new(HttpAuthScheme::Bearer), // Define it as a Bearer token type
+            ),
+        );
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -80,6 +130,7 @@ async fn main() {
         .and(warp::path!("channels" / String / "publish"))
         .and(warp::post())
         .and(warp::body::json())
+        .and(with_auth()) // Add authentication here
         .and(with_channels(channels_rest))
         .and_then(publish_message);
 
@@ -311,11 +362,13 @@ async fn process_rabbitmq_messages(
     responses(
         (status = 200, description = "Message sent"),
         (status = 404, description = "Channel not found")
-    )
+    ),
+    security(("bearerAuth" = []))  // Referencing the security scheme
 )]
 async fn publish_message(
     channel_name: String,
     publish_request: PublishRequest,
+    claims: Claims, // Add claims from JWT here
     _channels: Channels,
 ) -> Result<impl warp::Reply, warp::Rejection> {
     if let Ok(rabbit_channel) = connect_rabbitmq().await {

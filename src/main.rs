@@ -3,7 +3,6 @@ use futures::StreamExt;
 use jsonwebtoken::{decode, DecodingKey, Validation};
 use lapin::Error as LapinError;
 use lapin::{
-    message::Delivery,
     options::{BasicAckOptions, BasicConsumeOptions, BasicPublishOptions},
     BasicProperties, Channel as RabbitChannel, Connection, ConnectionProperties,
 }; // Renaming lapin::Channel to RabbitChannel
@@ -12,16 +11,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 use tokio::time::{sleep, Duration};
-use utoipa::{
-    openapi::security::{ApiKey, ApiKeyValue, SecurityScheme},
-    Modify, OpenApi, ToSchema,
-};
+use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::Config;
+use warp::Filter;
 use warp::{
     reject::Rejection,
     ws::{Message, WebSocket},
 };
-use warp::{reply::Reply, Filter};
 
 #[derive(Debug, Clone)]
 struct Channel {

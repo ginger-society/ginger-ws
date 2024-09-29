@@ -5,6 +5,7 @@ name = "ginger-ws"
 version = "0.1.0"
 
 [dependencies]
+IAMService = {path = "./IAMService_client"}
 futures = "0.3"
 jsonwebtoken = "9.3.0"
 lapin = "2.5.0"

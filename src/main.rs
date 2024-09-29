@@ -22,7 +22,8 @@ use warp::{
     ws::{Message, WebSocket},
 };
 use IAMService::apis::default_api::{
-    identity_get_group_members_ids, IdentityGetGroupMembersIdsParams,
+    identity_get_group_members_ids, identity_get_group_members_ids_user_land,
+    IdentityGetGroupMembersIdsParams, IdentityGetGroupMembersIdsUserLandParams,
 };
 use IAMService::get_configuration;
 
@@ -538,9 +539,9 @@ async fn publish_message_to_group(
             let iam_config = get_configuration(Some(auth_header));
 
             // Fetch group member IDs
-            match identity_get_group_members_ids(
+            match identity_get_group_members_ids_user_land(
                 &iam_config,
-                IdentityGetGroupMembersIdsParams {
+                IdentityGetGroupMembersIdsUserLandParams {
                     group_identifier: group_id,
                 },
             )

@@ -15,11 +15,13 @@ use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
 use utoipa::{openapi, Modify};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::Config;
+use warp::reject::Reject;
 use warp::Filter;
 use warp::{
     reject::Rejection,
     ws::{Message, WebSocket},
 };
+use IAMService::get_configuration;
 
 #[derive(Debug, Clone)]
 struct Channel {
@@ -67,6 +69,27 @@ fn with_auth() -> impl Filter<Extract = (Claims,), Error = warp::Rejection> + Cl
             }
         },
     )
+}
+
+// Define the custom rejection error
+#[derive(Debug)]
+struct InvalidTokenError;
+impl Reject for InvalidTokenError {}
+
+fn with_get_auth_header() -> impl Filter<Extract = (String,), Error = warp::Rejection> + Clone {
+    warp::header::<String>("Authorization").and_then(|auth_header: String| async move {
+        // Extract the token from the header "Authorization: token"
+        let token = auth_header
+            .strip_prefix("Bearer ")
+            .or(Some(auth_header.as_str()))
+            .unwrap_or("");
+
+        if !token.is_empty() {
+            Ok(token.to_string())
+        } else {
+            Err(warp::reject::custom(InvalidTokenError))
+        }
+    })
 }
 
 // Swagger configuration for the REST endpoints
@@ -131,6 +154,7 @@ async fn main() {
         .and(warp::post())
         .and(warp::body::json())
         .and(with_auth()) // Add authentication here
+        .and(with_get_auth_header())
         .and(with_channels(channels_rest))
         .and_then(publish_message);
 
@@ -369,10 +393,14 @@ async fn publish_message(
     channel_name: String,
     publish_request: PublishRequest,
     claims: Claims, // Add claims from JWT here
+    auth_header: String,
     _channels: Channels,
 ) -> Result<impl warp::Reply, warp::Rejection> {
     if let Ok(rabbit_channel) = connect_rabbitmq().await {
         // let payload = publish_request.message.clone().into_bytes();
+        println!("{:?}", auth_header);
+
+        let iam_config = get_configuration(Some(auth_header));
 
         let rabbit_message = RabbitMessage {
             channel_id: channel_name.clone(), // channel_id from the path

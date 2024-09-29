@@ -21,6 +21,9 @@ use warp::{
     reject::Rejection,
     ws::{Message, WebSocket},
 };
+use IAMService::apis::default_api::{
+    identity_get_group_members_ids, IdentityGetGroupMembersIdsParams,
+};
 use IAMService::get_configuration;
 
 #[derive(Debug, Clone)]
@@ -95,7 +98,7 @@ fn with_get_auth_header() -> impl Filter<Extract = (String,), Error = warp::Reje
 // Swagger configuration for the REST endpoints
 #[derive(OpenApi)]
 #[openapi(
-    paths(publish_message),
+    paths(publish_message, publish_message_to_group),
     components(
         schemas(PublishRequest)
     ),
@@ -158,6 +161,16 @@ async fn main() {
         .and(with_channels(channels_rest))
         .and_then(publish_message);
 
+    let channels_rest = channels.clone();
+    let group_publish_route = warp::path("notification")
+        .and(warp::path!("groups" / String / "publish"))
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(with_auth()) // Add authentication here
+        .and(with_get_auth_header())
+        .and(with_channels(channels_rest))
+        .and_then(publish_message_to_group);
+
     // Serve OpenAPI spec
     let api_doc = warp::path("notification")
         .and(warp::path("api-doc.json"))
@@ -175,7 +188,11 @@ async fn main() {
         .and_then(serve_swagger);
 
     // Combine all routes
-    let routes = websocket_route.or(publish_route).or(api_doc).or(swagger_ui);
+    let routes = websocket_route
+        .or(publish_route)
+        .or(group_publish_route)
+        .or(api_doc)
+        .or(swagger_ui);
 
     warp::serve(routes).run(([0, 0, 0, 0], 3030)).await;
 }
@@ -398,9 +415,6 @@ async fn publish_message(
 ) -> Result<impl warp::Reply, warp::Rejection> {
     if let Ok(rabbit_channel) = connect_rabbitmq().await {
         // let payload = publish_request.message.clone().into_bytes();
-        println!("{:?}", auth_header);
-
-        let iam_config = get_configuration(Some(auth_header));
 
         let rabbit_message = RabbitMessage {
             channel_id: channel_name.clone(), // channel_id from the path
@@ -429,6 +443,99 @@ async fn publish_message(
     } else {
         println!("Unable to connect to RabbitMQ");
         Ok(warp::reply::json(&"Unable to connect to RabbitMQ"))
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/notification/groups/{group_id}/publish",
+    params(
+        ("group_id" = String, Path, description = "The id of the group to publish to")
+    ),
+    request_body = PublishRequest,
+    responses(
+        (status = 200, description = "Message sent"),
+        (status = 404, description = "Channel not found")
+    ),
+    security(("bearerAuth" = []))  // Referencing the security scheme
+)]
+async fn publish_message_to_group(
+    group_id: String,
+    publish_request: PublishRequest,
+    claims: Claims, // Add claims from JWT here
+    auth_header: String,
+    _channels: Channels,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    // Connect to RabbitMQ using the connection pool
+    let rabbit_channel_result = connect_rabbitmq().await;
+
+    match rabbit_channel_result {
+        Ok(rabbit_channel) => {
+            println!("{:?}", auth_header);
+
+            let iam_config = get_configuration(Some(auth_header));
+
+            // Fetch group member IDs
+            match identity_get_group_members_ids(
+                &iam_config,
+                IdentityGetGroupMembersIdsParams {
+                    group_identifier: group_id,
+                },
+            )
+            .await
+            {
+                Ok(ids) => {
+                    let mut publish_results = vec![]; // Collect publish results
+
+                    for id in ids {
+                        let rabbit_message = RabbitMessage {
+                            channel_id: id.clone().to_string(), // Use the ID as the channel ID
+                            message: publish_request.message.clone(),
+                        };
+
+                        // Publish the message to the corresponding channel
+                        let publish_result = rabbit_channel
+                            .basic_publish(
+                                "real-time-updates", // Exchange name
+                                "",                  // Routing key
+                                BasicPublishOptions::default(),
+                                &serde_json::to_string(&rabbit_message).unwrap().into_bytes(),
+                                BasicProperties::default(),
+                            )
+                            .await;
+
+                        // Store the result of the publish attempt
+                        match publish_result {
+                            Ok(_) => {
+                                println!("Message successfully sent to RabbitMQ for ID: {}", id);
+                                publish_results.push(format!("Message sent for ID: {}", id));
+                            }
+                            Err(e) => {
+                                println!(
+                                    "Failed to send message to RabbitMQ for ID: {}: {:?}",
+                                    id, e
+                                );
+                                publish_results.push(format!(
+                                    "Failed to send message for ID: {}: {:?}",
+                                    id, e
+                                ));
+                            }
+                        }
+                    }
+
+                    // Respond with the results of the publish attempts
+                    Ok(warp::reply::json(&publish_results))
+                }
+                Err(e) => {
+                    println!("{:?}", e);
+                    Ok(warp::reply::json(&"Failed to get group members"))
+                }
+            }
+        }
+        Err(e) => {
+            println!("Unable to connect to RabbitMQ: {:?}", e);
+            Ok(warp::reply::json(&"Unable to connect to RabbitMQ"))
+        }
     }
 }
 

@@ -46,3 +46,20 @@ jobs:
     - name: Restart Kubernetes deployment
       run: kubectl rollout restart deployment notification-service-deployment
 
+    - name: Install ginger-apps
+      run: bash -c "$(curl -fsSL https://raw.githubusercontent.com/ginger-society/infra-as-code-repo/main/rust-helpers/install-all-clis.sh)"
+
+    - name: Authenticate with ginger-auth
+      id: ginger-auth
+      run: ginger-auth token-login ${{ secrets.GINGER_TOKEN }}
+
+    - name: Publish stage using ginger-connector
+      run: ginger-connector publish stage
+      env:
+        GINGER_TOKEN: ${{ secrets.GINGER_TOKEN }}
+
+    - name: Publish stage using ginger-connector for k8
+      run: ginger-connector publish stage-k8
+      env:
+        GINGER_TOKEN: ${{ secrets.GINGER_TOKEN }}
+

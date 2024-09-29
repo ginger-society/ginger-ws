@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 use tokio::time::{sleep, Duration};
-use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
+use utoipa::openapi::security::{ApiKey, ApiKeyValue, Http, HttpAuthScheme, SecurityScheme};
 use utoipa::{openapi, Modify};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::Config;
@@ -74,6 +74,35 @@ fn with_auth() -> impl Filter<Extract = (Claims,), Error = warp::Rejection> + Cl
     )
 }
 
+async fn authenticate_api_token(token: Option<String>) -> Result<APIClaims, warp::Rejection> {
+    if let Some(token) = token {
+        let secret = "1234"; // Use environment variable in production
+
+        let decoding_key = DecodingKey::from_secret(secret.as_ref());
+        let validation = Validation::new(jsonwebtoken::Algorithm::HS256);
+
+        match decode::<APIClaims>(&token, &decoding_key, &validation) {
+            Ok(token_data) => Ok(token_data.claims),
+            Err(_) => Err(warp::reject::custom(JWTError)),
+        }
+    } else {
+        Err(warp::reject::custom(JWTError))
+    }
+}
+
+fn with_api_auth() -> impl Filter<Extract = (APIClaims,), Error = warp::Rejection> + Clone {
+    warp::header::optional::<String>("X-API-Authorization").and_then(
+        |auth_header: Option<String>| async move {
+            if let Some(token) = auth_header {
+                let token = token.trim_start_matches("Bearer ").to_string();
+                authenticate_api_token(Some(token)).await
+            } else {
+                Err(warp::reject::custom(JWTError))
+            }
+        },
+    )
+}
+
 // Define the custom rejection error
 #[derive(Debug)]
 struct InvalidTokenError;
@@ -81,6 +110,22 @@ impl Reject for InvalidTokenError {}
 
 fn with_get_auth_header() -> impl Filter<Extract = (String,), Error = warp::Rejection> + Clone {
     warp::header::<String>("Authorization").and_then(|auth_header: String| async move {
+        // Extract the token from the header "Authorization: token"
+        let token = auth_header
+            .strip_prefix("Bearer ")
+            .or(Some(auth_header.as_str()))
+            .unwrap_or("");
+
+        if !token.is_empty() {
+            Ok(token.to_string())
+        } else {
+            Err(warp::reject::custom(InvalidTokenError))
+        }
+    })
+}
+
+fn with_get_api_auth_header() -> impl Filter<Extract = (String,), Error = warp::Rejection> + Clone {
+    warp::header::<String>("X-API-Authorization").and_then(|auth_header: String| async move {
         // Extract the token from the header "Authorization: token"
         let token = auth_header
             .strip_prefix("Bearer ")
@@ -120,6 +165,14 @@ impl Modify for SecurityAddon {
                 Http::new(HttpAuthScheme::Bearer), // Define it as a Bearer token type
             ),
         );
+        // Create the ApiKeyValue instance using the non-exhaustive struct's field(s)
+        let api_key_value = ApiKeyValue::new("X-API-Authorization".to_string());
+
+        // Using `ApiKey` enum to specify it as a header
+        let api_key_scheme = SecurityScheme::ApiKey(ApiKey::Header(api_key_value));
+
+        // Add the API key security scheme to the components
+        components.add_security_scheme("apiBearerAuth", api_key_scheme);
     }
 }
 
@@ -166,8 +219,8 @@ async fn main() {
         .and(warp::path!("groups" / String / "publish"))
         .and(warp::post())
         .and(warp::body::json())
-        .and(with_auth()) // Add authentication here
-        .and(with_get_auth_header())
+        .and(with_api_auth()) // Add authentication here
+        .and(with_get_api_auth_header())
         .and(with_channels(channels_rest))
         .and_then(publish_message_to_group);
 
@@ -250,6 +303,15 @@ struct Claims {
     token_type: String, // Add token_type to distinguish between access and refresh tokens
     client_id: String,
 }
+
+#[derive(Serialize, Deserialize)]
+pub struct APIClaims {
+    pub sub: String,
+    pub exp: usize,
+    pub group_id: i64,
+    pub scopes: Vec<String>,
+}
+
 // Custom JWT Error
 #[derive(Debug)]
 struct JWTError;
@@ -457,12 +519,12 @@ async fn publish_message(
         (status = 200, description = "Message sent"),
         (status = 404, description = "Channel not found")
     ),
-    security(("bearerAuth" = []))  // Referencing the security scheme
+    security(("apiBearerAuth" = []))  // Referencing the security scheme
 )]
 async fn publish_message_to_group(
     group_id: String,
     publish_request: PublishRequest,
-    claims: Claims, // Add claims from JWT here
+    _claims: APIClaims, // Add claims from JWT here
     auth_header: String,
     _channels: Channels,
 ) -> Result<impl warp::Reply, warp::Rejection> {

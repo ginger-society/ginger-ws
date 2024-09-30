@@ -2,7 +2,7 @@ dir = "."
 lang = "Rust"
 organization_id = "ginger-society"
 service_type = "RPCEndpoint"
-spec_url = "/api-doc.json"
+spec_url = "/notification/api-doc.json"
 
 [services."@ginger-society/IAMService"]
 dev = "http://localhost:8080/iam"
@@ -12,8 +12,8 @@ stage_k8 = "http://iam-service-api-service/iam"
 [portals_refs]
 
 [urls]
-dev = "http://localhost:3030/notification"
+dev = "http://localhost:3030"
 prod = "http://localhost:3030"
 prod_k8 = "http://localhost:3030"
-stage = "https://api-staging.gingersociety.org/notification"
-stage_k8 = "http://notification-service-service/notification"
+stage = "https://api-staging.gingersociety.org"
+stage_k8 = "http://notification-service-service"

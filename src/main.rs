@@ -539,9 +539,9 @@ async fn publish_message_to_group(
             let iam_config = get_configuration(Some(auth_header));
 
             // Fetch group member IDs
-            match identity_get_group_members_ids_user_land(
+            match identity_get_group_members_ids(
                 &iam_config,
-                IdentityGetGroupMembersIdsUserLandParams {
+                IdentityGetGroupMembersIdsParams {
                     group_identifier: group_id,
                 },
             )

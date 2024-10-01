@@ -64,3 +64,6 @@ jobs:
       env:
         GINGER_TOKEN: ${{ secrets.GINGER_TOKEN }}
 
+    - name: Trigger dependent pipelines
+      run: ginger-connector trigger-dependent-pipelines ${{ secrets.GH_TOKEN }}
+

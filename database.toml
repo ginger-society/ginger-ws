@@ -2,6 +2,7 @@
 branch = "stage"
 cache_schema_id = ""
 lang = "Rust"
+message_queue_schema_id = "6a06e876-b40f-472d-be2b-97a2867b88f3"
 orm = "Diesel"
 root = "src/models"
 schema_id = ""

@@ -7,6 +7,7 @@ version = "0.1.0"
 [dependencies]
 IAMService = {path = "./IAMService_client"}
 futures = "0.3"
+ginger-shared-rs = {version = "0.31.0-nightly.0", organization = "ginger-society"}
 jsonwebtoken = "9.3.0"
 lapin = "2.5.0"
 serde = {version = "1.0", features = ["derive"]}

@@ -1,5 +1,6 @@
 use futures::sink::SinkExt;
 use futures::StreamExt;
+use ginger_shared_rs::ISCClaims;
 use jsonwebtoken::{decode, DecodingKey, Validation};
 use lapin::Error as LapinError;
 use lapin::{
@@ -40,6 +41,14 @@ struct PublishRequest {
     message: String, // Only the message is in the body
 }
 
+#[derive(Deserialize, Serialize, ToSchema)]
+struct EmailRequest {
+    message: String,
+    to: String,
+    reply_to: Option<String>,
+    subject: String,
+}
+
 #[derive(Deserialize, Serialize)]
 struct RabbitMessage {
     channel_id: String,
@@ -75,6 +84,22 @@ fn with_auth() -> impl Filter<Extract = (Claims,), Error = warp::Rejection> + Cl
     )
 }
 
+async fn authenticate_isc_api_token(token: Option<String>) -> Result<ISCClaims, warp::Rejection> {
+    if let Some(token) = token {
+        let secret = "1234"; // Use environment variable in production
+
+        let decoding_key = DecodingKey::from_secret(secret.as_ref());
+        let validation = Validation::new(jsonwebtoken::Algorithm::HS256);
+
+        match decode::<ISCClaims>(&token, &decoding_key, &validation) {
+            Ok(token_data) => Ok(token_data.claims),
+            Err(_) => Err(warp::reject::custom(JWTError)),
+        }
+    } else {
+        Err(warp::reject::custom(JWTError))
+    }
+}
+
 async fn authenticate_api_token(token: Option<String>) -> Result<APIClaims, warp::Rejection> {
     if let Some(token) = token {
         let secret = "1234"; // Use environment variable in production
@@ -97,6 +122,19 @@ fn with_api_auth() -> impl Filter<Extract = (APIClaims,), Error = warp::Rejectio
             if let Some(token) = auth_header {
                 let token = token.trim_start_matches("Bearer ").to_string();
                 authenticate_api_token(Some(token)).await
+            } else {
+                Err(warp::reject::custom(JWTError))
+            }
+        },
+    )
+}
+
+fn with_isc_api_auth() -> impl Filter<Extract = (ISCClaims,), Error = warp::Rejection> + Clone {
+    warp::header::optional::<String>("X-ISC-API-Authorization").and_then(
+        |auth_header: Option<String>| async move {
+            if let Some(token) = auth_header {
+                let token = token.trim_start_matches("Bearer ").to_string();
+                authenticate_isc_api_token(Some(token)).await
             } else {
                 Err(warp::reject::custom(JWTError))
             }
@@ -174,6 +212,10 @@ impl Modify for SecurityAddon {
 
         // Add the API key security scheme to the components
         components.add_security_scheme("apiBearerAuth", api_key_scheme);
+
+        let api_isc_key_value = ApiKeyValue::new("X-ISC-API-Authorization".to_string());
+        let api_isc_key_scheme = SecurityScheme::ApiKey(ApiKey::Header(api_isc_key_value));
+        components.add_security_scheme("apiISCBearerAuth", api_isc_key_scheme);
     }
 }
 
@@ -225,6 +267,13 @@ async fn main() {
         .and(with_channels(channels_rest))
         .and_then(publish_message_to_group);
 
+    let send_email_route = warp::path("notification")
+        .and(warp::path!("send-email"))
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(with_isc_api_auth()) // Add authentication here
+        .and_then(send_email);
+
     // Serve OpenAPI spec
     let api_doc = warp::path("notification")
         .and(warp::path("api-doc.json"))
@@ -246,9 +295,10 @@ async fn main() {
         .or(publish_route)
         .or(group_publish_route)
         .or(api_doc)
+        .or(send_email_route)
         .or(swagger_ui);
 
-    warp::serve(routes).run(([0, 0, 0, 0], 3030)).await;
+    warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
 }
 
 // Filter to inject channels into the route handlers
@@ -454,6 +504,23 @@ async fn process_rabbitmq_messages(
     }
 
     Ok(())
+}
+
+#[utoipa::path(
+    post,
+    path = "/notification/send-email",
+    request_body = EmailRequest,
+    responses(
+        (status = 200, description = "Email sent"),
+    ),
+    security(("apiISCBearerAuth" = []))  // Referencing the security scheme
+)]
+async fn send_email(
+    email_request: EmailRequest,
+    claims: ISCClaims, // Add claims from JWT here
+) -> Result<impl warp::Reply, warp::Rejection> {
+    println!("claims : {:?}", claims);
+    Ok(warp::reply::json(&"Email sent"))
 }
 
 #[utoipa::path(

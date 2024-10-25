@@ -182,9 +182,9 @@ fn with_get_api_auth_header() -> impl Filter<Extract = (String,), Error = warp::
 // Swagger configuration for the REST endpoints
 #[derive(OpenApi)]
 #[openapi(
-    paths(publish_message, publish_message_to_group),
+    paths(publish_message, publish_message_to_group, send_email),
     components(
-        schemas(PublishRequest)
+        schemas(PublishRequest, EmailRequest)
     ),
     tags((name = "channels", description = "Channel publishing and WebSocket subscription")),
     modifiers(&SecurityAddon),
@@ -298,7 +298,7 @@ async fn main() {
         .or(send_email_route)
         .or(swagger_ui);
 
-    warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
+    warp::serve(routes).run(([0, 0, 0, 0], 3030)).await;
 }
 
 // Filter to inject channels into the route handlers

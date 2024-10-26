@@ -19,6 +19,8 @@ RUN cargo build --release
 # Second stage: Create the minimal runtime image
 FROM gingersociety/rust-rocket-api-runner:latest
 
+RUN apt-get update && apt-get install -y ca-certificates
+
 # Copy the compiled binary from the builder stage
 COPY --from=builder /app/target/release/NotificationService /app/
 

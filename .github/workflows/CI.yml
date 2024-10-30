@@ -11,65 +11,99 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v2
-    
-    - name: Install ginger-apps
-      run: bash -c "$(curl -fsSL https://raw.githubusercontent.com/ginger-society/infra-as-code-repo/main/rust-helpers/install-pipeline-clis.sh)"
+      - name: Checkout repository
+        uses: actions/checkout@v2
 
-    - name: Authenticate with ginger-auth
-      id: ginger-auth
-      run: ginger-auth token-login ${{ secrets.GINGER_TOKEN }}
+      - name: Install ginger-apps
+        run: bash -c "$(curl -fsSL https://raw.githubusercontent.com/ginger-society/infra-as-code-repo/main/rust-helpers/install-pipeline-clis.sh)"
+      - name: Report failure if ginger-apps installation fails
+        if: failure()
+        run: ginger-connector update-pipeline stage failed
 
-    - name: Update pipeline to running
-      run: ginger-connector update-pipeline stage running
+      - name: Authenticate with ginger-auth
+        id: ginger-auth
+        run: ginger-auth token-login ${{ secrets.GINGER_TOKEN }}
+      - name: Report failure if authentication fails
+        if: failure()
+        run: ginger-connector update-pipeline stage failed
 
-    - name: Set up cache for Cargo
-      uses: actions/cache@v2
-      with:
-        path: |
-          target
-          Cargo.lock
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-
+      - name: Update pipeline to running
+        run: ginger-connector update-pipeline stage running
 
-    - name: Log in to Docker Hub
-      run: echo "${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" --password-stdin
+      - name: Set up cache for Cargo
+        uses: actions/cache@v2
+        with:
+          path: |
+            target
+            Cargo.lock
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - name: Report failure if Cargo cache setup fails
+        if: failure()
+        run: ginger-connector update-pipeline stage failed
 
-    - name: Build Docker image
-      run: docker build -t ${{ secrets.DOCKER_HUB_USERNAME }}/notification-service-stage:latest -f Dockerfile.build . --build-arg GINGER_TOKEN=${{ secrets.GINGER_TOKEN }}
+      - name: Log in to Docker Hub
+        run: echo "${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" --password-stdin
+      - name: Report failure if Docker login fails
+        if: failure()
+        run: ginger-connector update-pipeline stage failed
 
-    - name: Push Docker image
-      run: docker push ${{ secrets.DOCKER_HUB_USERNAME }}/notification-service-stage:latest
+      - name: Build Docker image
+        run: docker build -t ${{ secrets.DOCKER_HUB_USERNAME }}/notification-service-stage:latest -f Dockerfile.build . --build-arg GINGER_TOKEN=${{ secrets.GINGER_TOKEN }}
+      - name: Report failure if Docker build fails
+        if: failure()
+        run: ginger-connector update-pipeline stage failed
 
-    - name: Set up Kubeconfig
-      run: |
-        mkdir -p $HOME/.kube
-        echo "${{ secrets.STAGING_K8_CONFIG }}" > $HOME/.kube/config
+      - name: Push Docker image
+        run: docker push ${{ secrets.DOCKER_HUB_USERNAME }}/notification-service-stage:latest
+      - name: Report failure if Docker push fails
+        if: failure()
+        run: ginger-connector update-pipeline stage failed
 
-    - name: Install kubectl
-      run: |
-        curl -LO "https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl"
-        chmod +x ./kubectl
-        sudo mv ./kubectl /usr/local/bin/kubectl
+      - name: Set up Kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.STAGING_K8_CONFIG }}" > $HOME/.kube/config
+      - name: Report failure if Kubeconfig setup fails
+        if: failure()
+        run: ginger-connector update-pipeline stage failed
 
-    - name: Restart Kubernetes deployment
-      run: kubectl rollout restart deployment notification-service-deployment
+      - name: Install kubectl
+        run: |
+          curl -LO "https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x ./kubectl
+          sudo mv ./kubectl /usr/local/bin/kubectl
+      - name: Report failure if kubectl installation fails
+        if: failure()
+        run: ginger-connector update-pipeline stage failed
 
-    - name: Publish stage using ginger-connector
-      run: ginger-connector publish stage
-      env:
-        GINGER_TOKEN: ${{ secrets.GINGER_TOKEN }}
+      - name: Restart Kubernetes deployment
+        run: kubectl rollout restart deployment notification-service-deployment
+      - name: Report failure if Kubernetes deployment restart fails
+        if: failure()
+        run: ginger-connector update-pipeline stage failed
 
-    - name: Publish stage using ginger-connector for k8
-      run: ginger-connector publish stage-k8
-      env:
-        GINGER_TOKEN: ${{ secrets.GINGER_TOKEN }}
+      - name: Publish stage using ginger-connector
+        run: ginger-connector publish stage
+        env:
+          GINGER_TOKEN: ${{ secrets.GINGER_TOKEN }}
+      - name: Report failure if publish stage fails
+        if: failure()
+        run: ginger-connector update-pipeline stage failed
 
-    - name: Update pipeline to passing
-      run: ginger-connector update-pipeline stage passing
+      - name: Publish stage using ginger-connector for k8
+        run: ginger-connector publish stage-k8
+        env:
+          GINGER_TOKEN: ${{ secrets.GINGER_TOKEN }}
+      - name: Report failure if publish stage-k8 fails
+        if: failure()
+        run: ginger-connector update-pipeline stage failed
 
-    - name: Trigger dependent pipelines
-      run: ginger-connector trigger-dependent-pipelines ${{ secrets.GH_TOKEN }}
+      - name: Update pipeline to passing
+        if: success()
+        run: ginger-connector update-pipeline stage passing
 
+      - name: Trigger dependent pipelines
+        if: success()
+        run: ginger-connector trigger-dependent-pipelines ${{ secrets.GH_TOKEN }}

@@ -14,6 +14,7 @@ use lapin::{
     options::{BasicAckOptions, BasicConsumeOptions, BasicPublishOptions},
     BasicProperties, Channel as RabbitChannel, Connection, ConnectionProperties,
 }; // Renaming lapin::Channel to RabbitChannel
+use prometheus::{Encoder, IntCounter, Opts, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -60,6 +61,40 @@ struct EmailRequest {
 struct RabbitMessage {
     channel_id: String,
     message: String,
+}
+
+// Create a registry to hold the metrics
+lazy_static::lazy_static! {
+    static ref REGISTRY: Registry = Registry::new();
+}
+
+// Define metrics
+lazy_static::lazy_static! {
+    static ref REQUEST_COUNTER: IntCounter = IntCounter::with_opts(Opts::new("request_count", "Total number of requests"))
+        .expect("Counter can be created");
+}
+
+#[derive(Debug)]
+struct EncodeError;
+impl Reject for EncodeError {}
+
+async fn metrics_handler() -> Result<impl warp::Reply, warp::Rejection> {
+    let encoder = TextEncoder::new();
+    let mut buffer = Vec::new();
+
+    // Gather metrics from the global registry
+    REGISTRY.gather();
+
+    // Encode the metrics
+    encoder
+        .encode(&REGISTRY.gather(), &mut buffer)
+        .map_err(|e| warp::reject::custom(EncodeError))?;
+
+    Ok(warp::reply::with_header(
+        String::from_utf8(buffer).unwrap(),
+        "Content-Type",
+        "text/plain; version=0.0.4",
+    ))
 }
 
 async fn authenticate_token(token: Option<String>) -> Result<Claims, warp::Rejection> {
@@ -228,6 +263,17 @@ impl Modify for SecurityAddon {
 
 #[tokio::main]
 async fn main() {
+    // Register metrics with the global registry
+    REGISTRY
+        .register(Box::new(REQUEST_COUNTER.clone()))
+        .unwrap();
+
+    // Define the metrics route
+    let metrics_route = warp::path("notification")
+        .and(warp::path("metrics"))
+        .and(warp::get())
+        .and_then(metrics_handler);
+
     let channels: Channels = Arc::new(Mutex::new(HashMap::new()));
 
     // Start RabbitMQ consumer
@@ -303,7 +349,8 @@ async fn main() {
         .or(group_publish_route)
         .or(api_doc)
         .or(send_email_route)
-        .or(swagger_ui);
+        .or(swagger_ui)
+        .or(metrics_route);
 
     warp::serve(routes).run(([0, 0, 0, 0], 3030)).await;
 }
@@ -650,6 +697,7 @@ async fn publish_message_to_group(
     _channels: Channels,
 ) -> Result<impl warp::Reply, warp::Rejection> {
     // Connect to RabbitMQ using the connection pool
+    REQUEST_COUNTER.inc();
     let rabbit_channel_result = connect_rabbitmq().await;
 
     match rabbit_channel_result {

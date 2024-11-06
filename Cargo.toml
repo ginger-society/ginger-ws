@@ -12,6 +12,8 @@ futures = "0.3"
 ginger-shared-rs = {version = "0.31.0-nightly.0", organization = "ginger-society"}
 jsonwebtoken = "9.3.0"
 lapin = "2.5.0"
+lazy_static = "1.5.0"
+prometheus = "0.13.4"
 serde = {version = "1.0", features = ["derive"]}
 serde_json = "1.0"
 tokio = {version = "1", features = ["full"]}

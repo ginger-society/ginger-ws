@@ -1,199 +1,40 @@
 use crate::mailer::__path_send_email;
 use crate::rest_bridge::{__path_publish_message, __path_publish_message_to_group};
 
-use auth_helpers::{handle_ws_upgrade, user_authenticated};
-use futures::sink::SinkExt;
-use futures::StreamExt;
-use ginger_shared_rs::rocket_utils::APIClaims;
-use ginger_shared_rs::rocket_utils::Claims;
-use ginger_shared_rs::ISCClaims;
-use jsonwebtoken::{decode, DecodingKey, Validation};
-use lapin::Error as LapinError;
-use lapin::{
-    options::{BasicAckOptions, BasicConsumeOptions},
-    Channel as RabbitChannel,
+use auth_helpers::{
+    handle_ws_upgrade, user_authenticated, with_api_auth, with_auth, with_get_api_auth_header,
+    with_get_auth_header, with_isc_api_auth,
 };
-use prom_helpers::{REGISTRY, REQUEST_COUNTER};
+
+use auth_schemas::SecurityAddon;
+
+use message_queue_helpers::consume_messages;
+use prom_helpers::{metrics_handler, REGISTRY, REQUEST_COUNTER};
 // Renaming lapin::Channel to RabbitChannel
-use prometheus::{Encoder, IntCounter, Opts, Registry, TextEncoder};
 use requests::EmailRequest;
 use requests::PublishRequest;
-use requests::RabbitMessage;
-use responses::JWTError;
 use rest_bridge::publish_message;
 use rest_bridge::publish_message_to_group;
-use shared::connect_rabbitmq;
+use shared::with_channels;
 use shared::Channels;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex};
-use tokio::time::{sleep, Duration};
-use utoipa::openapi::security::{ApiKey, ApiKeyValue, Http, HttpAuthScheme, SecurityScheme};
-use utoipa::{Modify, OpenApi};
+use tokio::sync::Mutex;
+
+use utoipa::OpenApi;
 use utoipa_swagger_ui::Config;
-use warp::reject::Reject;
 use warp::Filter;
-use warp::{
-    reject::Rejection,
-    ws::{Message, WebSocket},
-};
 
 mod auth_helpers;
+mod auth_schemas;
 mod mailer;
+mod message_queue_helpers;
 mod prom_helpers;
 mod requests;
 mod responses;
 mod rest_bridge;
 mod shared;
 use crate::mailer::send_email;
-use crate::shared::Channel;
-
-#[derive(Debug)]
-struct EncodeError;
-impl Reject for EncodeError {}
-
-async fn metrics_handler() -> Result<impl warp::Reply, warp::Rejection> {
-    let encoder = TextEncoder::new();
-    let mut buffer = Vec::new();
-
-    // Gather metrics from the global registry
-    REGISTRY.gather();
-
-    // Encode the metrics
-    encoder
-        .encode(&REGISTRY.gather(), &mut buffer)
-        .map_err(|e| warp::reject::custom(EncodeError))?;
-
-    Ok(warp::reply::with_header(
-        String::from_utf8(buffer).unwrap(),
-        "Content-Type",
-        "text/plain; version=0.0.4",
-    ))
-}
-
-async fn authenticate_token(token: Option<String>) -> Result<Claims, warp::Rejection> {
-    if let Some(token) = token {
-        let secret = "1234"; // Use environment variable in production
-
-        let decoding_key = DecodingKey::from_secret(secret.as_ref());
-        let validation = Validation::new(jsonwebtoken::Algorithm::HS256);
-
-        match decode::<Claims>(&token, &decoding_key, &validation) {
-            Ok(token_data) => Ok(token_data.claims),
-            Err(_) => Err(warp::reject::custom(JWTError)),
-        }
-    } else {
-        Err(warp::reject::custom(JWTError))
-    }
-}
-
-fn with_auth() -> impl Filter<Extract = (Claims,), Error = warp::Rejection> + Clone {
-    warp::header::optional::<String>("Authorization").and_then(
-        |auth_header: Option<String>| async move {
-            if let Some(token) = auth_header {
-                let token = token.trim_start_matches("Bearer ").to_string();
-                authenticate_token(Some(token)).await
-            } else {
-                Err(warp::reject::custom(JWTError))
-            }
-        },
-    )
-}
-
-async fn authenticate_isc_api_token(token: Option<String>) -> Result<ISCClaims, warp::Rejection> {
-    if let Some(token) = token {
-        let secret = "1234"; // Use environment variable in production
-
-        let decoding_key = DecodingKey::from_secret(secret.as_ref());
-        let validation = Validation::new(jsonwebtoken::Algorithm::HS256);
-
-        match decode::<ISCClaims>(&token, &decoding_key, &validation) {
-            Ok(token_data) => Ok(token_data.claims),
-            Err(_) => Err(warp::reject::custom(JWTError)),
-        }
-    } else {
-        Err(warp::reject::custom(JWTError))
-    }
-}
-
-async fn authenticate_api_token(token: Option<String>) -> Result<APIClaims, warp::Rejection> {
-    if let Some(token) = token {
-        let secret = "1234"; // Use environment variable in production
-
-        let decoding_key = DecodingKey::from_secret(secret.as_ref());
-        let validation = Validation::new(jsonwebtoken::Algorithm::HS256);
-
-        match decode::<APIClaims>(&token, &decoding_key, &validation) {
-            Ok(token_data) => Ok(token_data.claims),
-            Err(_) => Err(warp::reject::custom(JWTError)),
-        }
-    } else {
-        Err(warp::reject::custom(JWTError))
-    }
-}
-
-fn with_api_auth() -> impl Filter<Extract = (APIClaims,), Error = warp::Rejection> + Clone {
-    warp::header::optional::<String>("X-API-Authorization").and_then(
-        |auth_header: Option<String>| async move {
-            if let Some(token) = auth_header {
-                let token = token.trim_start_matches("Bearer ").to_string();
-                authenticate_api_token(Some(token)).await
-            } else {
-                Err(warp::reject::custom(JWTError))
-            }
-        },
-    )
-}
-
-fn with_isc_api_auth() -> impl Filter<Extract = (ISCClaims,), Error = warp::Rejection> + Clone {
-    warp::header::optional::<String>("X-ISC-API-Authorization").and_then(
-        |auth_header: Option<String>| async move {
-            if let Some(token) = auth_header {
-                let token = token.trim_start_matches("Bearer ").to_string();
-                authenticate_isc_api_token(Some(token)).await
-            } else {
-                Err(warp::reject::custom(JWTError))
-            }
-        },
-    )
-}
-
-// Define the custom rejection error
-#[derive(Debug)]
-struct InvalidTokenError;
-impl Reject for InvalidTokenError {}
-
-fn with_get_auth_header() -> impl Filter<Extract = (String,), Error = warp::Rejection> + Clone {
-    warp::header::<String>("Authorization").and_then(|auth_header: String| async move {
-        // Extract the token from the header "Authorization: token"
-        let token = auth_header
-            .strip_prefix("Bearer ")
-            .or(Some(auth_header.as_str()))
-            .unwrap_or("");
-
-        if !token.is_empty() {
-            Ok(token.to_string())
-        } else {
-            Err(warp::reject::custom(InvalidTokenError))
-        }
-    })
-}
-
-fn with_get_api_auth_header() -> impl Filter<Extract = (String,), Error = warp::Rejection> + Clone {
-    warp::header::<String>("X-API-Authorization").and_then(|auth_header: String| async move {
-        // Extract the token from the header "Authorization: token"
-        let token = auth_header
-            .strip_prefix("Bearer ")
-            .or(Some(auth_header.as_str()))
-            .unwrap_or("");
-
-        if !token.is_empty() {
-            Ok(token.to_string())
-        } else {
-            Err(warp::reject::custom(InvalidTokenError))
-        }
-    })
-}
 
 // Swagger configuration for the REST endpoints
 #[derive(OpenApi)]
@@ -206,34 +47,6 @@ fn with_get_api_auth_header() -> impl Filter<Extract = (String,), Error = warp::
     modifiers(&SecurityAddon),
 )]
 struct ApiDoc;
-
-struct SecurityAddon;
-impl Modify for SecurityAddon {
-    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
-        // Safely get the components
-        let components = openapi.components.as_mut().unwrap();
-
-        // Add a Bearer token security scheme globally
-        components.add_security_scheme(
-            "bearerAuth", // Name of the security scheme
-            SecurityScheme::Http(
-                Http::new(HttpAuthScheme::Bearer), // Define it as a Bearer token type
-            ),
-        );
-        // Create the ApiKeyValue instance using the non-exhaustive struct's field(s)
-        let api_key_value = ApiKeyValue::new("X-API-Authorization".to_string());
-
-        // Using `ApiKey` enum to specify it as a header
-        let api_key_scheme = SecurityScheme::ApiKey(ApiKey::Header(api_key_value));
-
-        // Add the API key security scheme to the components
-        components.add_security_scheme("apiBearerAuth", api_key_scheme);
-
-        let api_isc_key_value = ApiKeyValue::new("X-ISC-API-Authorization".to_string());
-        let api_isc_key_scheme = SecurityScheme::ApiKey(ApiKey::Header(api_isc_key_value));
-        components.add_security_scheme("apiISCBearerAuth", api_isc_key_scheme);
-    }
-}
 
 #[tokio::main]
 async fn main() {
@@ -327,77 +140,6 @@ async fn main() {
         .or(metrics_route);
 
     warp::serve(routes).run(([0, 0, 0, 0], 3030)).await;
-}
-
-// Filter to inject channels into the route handlers
-fn with_channels(
-    channels: Channels,
-) -> impl Filter<Extract = (Channels,), Error = std::convert::Infallible> + Clone {
-    warp::any().map(move || channels.clone())
-}
-
-async fn consume_messages(channels: Channels) {
-    loop {
-        match connect_rabbitmq().await {
-            Ok(rabbit_channel) => {
-                if let Err(e) = process_rabbitmq_messages(rabbit_channel, channels.clone()).await {
-                    eprintln!("Error processing messages: {:?}", e);
-                }
-            }
-            Err(e) => {
-                eprintln!("Error connecting to RabbitMQ: {:?}", e);
-            }
-        }
-
-        // Wait before retrying
-        eprintln!("Reconnecting to RabbitMQ in 5 seconds...");
-        sleep(Duration::from_secs(5)).await;
-    }
-}
-
-async fn process_rabbitmq_messages(
-    rabbit_channel: RabbitChannel,
-    channels: Channels,
-) -> Result<(), LapinError> {
-    let mut consumer = rabbit_channel
-        .basic_consume(
-            "real-time-updates-queue",
-            "consumer_tag",
-            BasicConsumeOptions::default(),
-            Default::default(),
-        )
-        .await?;
-
-    while let Some(delivery) = consumer.next().await {
-        match delivery {
-            Ok(delivery) => {
-                // Handle message processing and acknowledgment
-                let message = String::from_utf8_lossy(&delivery.data).to_string();
-                println!("Received message from RabbitMQ: {}", message);
-
-                if let Ok(rabbit_message) = serde_json::from_str::<RabbitMessage>(&message) {
-                    let channels_lock = channels.lock().await;
-                    if let Some(channel) = channels_lock.get(&rabbit_message.channel_id) {
-                        let _ = channel.tx.send(rabbit_message.message.clone());
-                        delivery.ack(BasicAckOptions::default()).await?;
-                    } else {
-                        println!(
-                            "Message for non-existent channel: {}",
-                            rabbit_message.channel_id
-                        );
-                    }
-                } else {
-                    println!("Failed to deserialize message from RabbitMQ");
-                }
-            }
-            Err(e) => {
-                eprintln!("Error receiving message: {:?}", e);
-                return Err(e); // Return error to trigger reconnection
-            }
-        }
-    }
-
-    Ok(())
 }
 
 // Serve Swagger UI assets

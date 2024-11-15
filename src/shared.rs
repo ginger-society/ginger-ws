@@ -2,15 +2,20 @@ use std::{collections::HashMap, sync::Arc};
 
 use tokio::sync::{broadcast, Mutex};
 
-use lapin::{
-    options::{BasicAckOptions, BasicConsumeOptions, BasicPublishOptions},
-    BasicProperties, Channel as RabbitChannel, Connection, ConnectionProperties,
-};
+use lapin::{Channel as RabbitChannel, Connection, ConnectionProperties};
+use warp::Filter;
 
 #[derive(Debug, Clone)]
 pub struct Channel {
     pub name: String,
     pub tx: broadcast::Sender<String>,
+}
+
+// Filter to inject channels into the route handlers
+pub fn with_channels(
+    channels: Channels,
+) -> impl Filter<Extract = (Channels,), Error = std::convert::Infallible> + Clone {
+    warp::any().map(move || channels.clone())
 }
 
 pub type Channels = Arc<Mutex<HashMap<String, Channel>>>;

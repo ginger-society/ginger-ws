@@ -1,3 +1,5 @@
+use crate::mailer::__path_send_email;
+use crate::rest_bridge::{__path_publish_message, __path_publish_message_to_group};
 use aws_config::meta::region::RegionProviderChain;
 use aws_config::Region;
 use aws_sdk_ses::types::Body as EmailBody;
@@ -7,6 +9,8 @@ use aws_sdk_ses::types::Message as EmailMessage;
 use aws_sdk_ses::Client;
 use futures::sink::SinkExt;
 use futures::StreamExt;
+use ginger_shared_rs::rocket_utils::APIClaims;
+use ginger_shared_rs::rocket_utils::Claims;
 use ginger_shared_rs::ISCClaims;
 use jsonwebtoken::{decode, DecodingKey, Validation};
 use lapin::Error as LapinError;
@@ -15,7 +19,14 @@ use lapin::{
     BasicProperties, Channel as RabbitChannel, Connection, ConnectionProperties,
 }; // Renaming lapin::Channel to RabbitChannel
 use prometheus::{Encoder, IntCounter, Opts, Registry, TextEncoder};
+use requests::EmailRequest;
+use requests::PublishRequest;
+use requests::RabbitMessage;
+use rest_bridge::publish_message;
+use rest_bridge::publish_message_to_group;
 use serde::{Deserialize, Serialize};
+use shared::connect_rabbitmq;
+use shared::Channels;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
@@ -34,34 +45,12 @@ use IAMService::apis::default_api::{
     identity_get_group_members_ids, identity_get_group_members_ids_user_land,
     IdentityGetGroupMembersIdsParams, IdentityGetGroupMembersIdsUserLandParams,
 };
-use IAMService::get_configuration;
-
-#[derive(Debug, Clone)]
-struct Channel {
-    name: String,
-    tx: broadcast::Sender<String>,
-}
-
-type Channels = Arc<Mutex<HashMap<String, Channel>>>;
-
-#[derive(Deserialize, Serialize, ToSchema)]
-struct PublishRequest {
-    message: String, // Only the message is in the body
-}
-
-#[derive(Deserialize, Serialize, ToSchema)]
-struct EmailRequest {
-    message: String,
-    to: String,
-    reply_to: Option<String>,
-    subject: String,
-}
-
-#[derive(Deserialize, Serialize)]
-struct RabbitMessage {
-    channel_id: String,
-    message: String,
-}
+mod mailer;
+mod requests;
+mod rest_bridge;
+mod shared;
+use crate::mailer::send_email;
+use crate::shared::Channel;
 
 // Create a registry to hold the metrics
 lazy_static::lazy_static! {
@@ -400,23 +389,6 @@ async fn user_connected(ws: WebSocket, channel_name: String, channels: Channels)
     });
 }
 
-#[derive(Deserialize, Serialize)]
-struct Claims {
-    sub: String,
-    exp: usize,
-    user_id: String,
-    token_type: String, // Add token_type to distinguish between access and refresh tokens
-    client_id: String,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct APIClaims {
-    pub sub: String,
-    pub exp: usize,
-    pub group_id: i64,
-    pub scopes: Vec<String>,
-}
-
 // Custom JWT Error
 #[derive(Debug)]
 struct JWTError;
@@ -455,45 +427,6 @@ async fn user_authenticated(
         println!("Token query parameter missing");
         Err(warp::reject::custom(JWTError))
     }
-}
-
-async fn connect_rabbitmq() -> Result<RabbitChannel, lapin::Error> {
-    let addr = std::env::var("AMPQ_URI")
-        .unwrap_or_else(|_| "amqp://user:password@localhost:5672/%2f".to_string());
-
-    let conn = Connection::connect(&addr, ConnectionProperties::default()).await?;
-    let channel = conn.create_channel().await?;
-
-    // Declare an exchange if needed
-    channel
-        .exchange_declare(
-            "real-time-updates",
-            lapin::ExchangeKind::Fanout,
-            Default::default(),
-            Default::default(),
-        )
-        .await?;
-
-    // Declare a queue for consuming messages
-    channel
-        .queue_declare(
-            "real-time-updates-queue",
-            Default::default(),
-            Default::default(),
-        )
-        .await?;
-
-    channel
-        .queue_bind(
-            "real-time-updates-queue",
-            "real-time-updates",
-            "",
-            Default::default(),
-            Default::default(),
-        )
-        .await?;
-
-    Ok(channel)
 }
 
 async fn consume_messages(channels: Channels) {
@@ -558,216 +491,6 @@ async fn process_rabbitmq_messages(
     }
 
     Ok(())
-}
-
-#[utoipa::path(
-    post,
-    path = "/notification/send-email",
-    request_body = EmailRequest,
-    responses(
-        (status = 200, description = "Email sent"),
-    ),
-    security(("apiISCBearerAuth" = []))  // Referencing the security scheme
-)]
-async fn send_email(
-    email_request: EmailRequest,
-    claims: ISCClaims, // Add claims from JWT here
-) -> Result<impl warp::Reply, warp::Rejection> {
-    println!("claims : {:?}", claims);
-    // Set up AWS SES client
-    let region_provider =
-        RegionProviderChain::default_provider().or_else(Region::new("ap-south-1"));
-    let config = aws_config::from_env().region(region_provider).load().await;
-    let client = Client::new(&config);
-
-    let destination = Destination::builder()
-        .to_addresses(email_request.to.clone())
-        .build();
-
-    // Construct the Message object
-    let message = EmailMessage::builder()
-        .subject(
-            EmailContent::builder()
-                .data(email_request.subject.clone())
-                .build()
-                .unwrap(),
-        )
-        .body(
-            EmailBody::builder()
-                .text(
-                    EmailContent::builder()
-                        .data(email_request.message.clone())
-                        .build()
-                        .unwrap(),
-                )
-                .build(),
-        )
-        .build();
-
-    // Prepare the SES email request
-    let email_result = client
-        .send_email()
-        .source("no-reply@gingersociety.org") // Replace with SES verified email
-        .destination(destination)
-        .message(message)
-        .send()
-        .await;
-
-    // Check for errors and send response
-    match email_result {
-        Ok(_) => Ok(warp::reply::json(&"Email sent")),
-        Err(err) => {
-            eprintln!("Failed to send email: {:?}", err);
-            Ok(warp::reply::json(&"Failed to send email"))
-        }
-    }
-}
-
-#[utoipa::path(
-    post,
-    path = "/notification/channels/{channel_name}/publish",
-    params(
-        ("channel_name" = String, Path, description = "The name of the channel to publish to")
-    ),
-    request_body = PublishRequest,
-    responses(
-        (status = 200, description = "Message sent"),
-        (status = 404, description = "Channel not found")
-    ),
-    security(("bearerAuth" = []))  // Referencing the security scheme
-)]
-async fn publish_message(
-    channel_name: String,
-    publish_request: PublishRequest,
-    claims: Claims, // Add claims from JWT here
-    auth_header: String,
-    _channels: Channels,
-) -> Result<impl warp::Reply, warp::Rejection> {
-    if let Ok(rabbit_channel) = connect_rabbitmq().await {
-        // let payload = publish_request.message.clone().into_bytes();
-
-        let rabbit_message = RabbitMessage {
-            channel_id: channel_name.clone(), // channel_id from the path
-            message: publish_request.message.clone(),
-        };
-
-        match rabbit_channel
-            .basic_publish(
-                "real-time-updates", // Exchange name
-                "",                  // Routing key
-                BasicPublishOptions::default(),
-                &serde_json::to_string(&rabbit_message).unwrap().into_bytes(),
-                BasicProperties::default(),
-            )
-            .await
-        {
-            Ok(_) => {
-                println!("Message successfully sent to RabbitMQ");
-                Ok(warp::reply::json(&"Message sent"))
-            }
-            Err(e) => {
-                println!("Failed to send message to RabbitMQ: {:?}", e);
-                Ok(warp::reply::json(&"Failed to send message to RabbitMQ"))
-            }
-        }
-    } else {
-        println!("Unable to connect to RabbitMQ");
-        Ok(warp::reply::json(&"Unable to connect to RabbitMQ"))
-    }
-}
-
-#[utoipa::path(
-    post,
-    path = "/notification/groups/{group_id}/publish",
-    params(
-        ("group_id" = String, Path, description = "The id of the group to publish to")
-    ),
-    request_body = PublishRequest,
-    responses(
-        (status = 200, description = "Message sent"),
-        (status = 404, description = "Channel not found")
-    ),
-    security(("apiBearerAuth" = []))  // Referencing the security scheme
-)]
-async fn publish_message_to_group(
-    group_id: String,
-    publish_request: PublishRequest,
-    _claims: APIClaims, // Add claims from JWT here
-    auth_header: String,
-    _channels: Channels,
-) -> Result<impl warp::Reply, warp::Rejection> {
-    // Connect to RabbitMQ using the connection pool
-    REQUEST_COUNTER.inc();
-    let rabbit_channel_result = connect_rabbitmq().await;
-
-    match rabbit_channel_result {
-        Ok(rabbit_channel) => {
-            println!("{:?}", auth_header);
-
-            let iam_config = get_configuration(Some(auth_header));
-
-            // Fetch group member IDs
-            match identity_get_group_members_ids(
-                &iam_config,
-                IdentityGetGroupMembersIdsParams {
-                    group_identifier: group_id,
-                },
-            )
-            .await
-            {
-                Ok(ids) => {
-                    let mut publish_results = vec![]; // Collect publish results
-
-                    for id in ids {
-                        let rabbit_message = RabbitMessage {
-                            channel_id: id.clone().to_string(), // Use the ID as the channel ID
-                            message: publish_request.message.clone(),
-                        };
-
-                        // Publish the message to the corresponding channel
-                        let publish_result = rabbit_channel
-                            .basic_publish(
-                                "real-time-updates", // Exchange name
-                                "",                  // Routing key
-                                BasicPublishOptions::default(),
-                                &serde_json::to_string(&rabbit_message).unwrap().into_bytes(),
-                                BasicProperties::default(),
-                            )
-                            .await;
-
-                        // Store the result of the publish attempt
-                        match publish_result {
-                            Ok(_) => {
-                                println!("Message successfully sent to RabbitMQ for ID: {}", id);
-                                publish_results.push(format!("Message sent for ID: {}", id));
-                            }
-                            Err(e) => {
-                                println!(
-                                    "Failed to send message to RabbitMQ for ID: {}: {:?}",
-                                    id, e
-                                );
-                                publish_results.push(format!(
-                                    "Failed to send message for ID: {}: {:?}",
-                                    id, e
-                                ));
-                            }
-                        }
-                    }
-
-                    // Respond with the results of the publish attempts
-                    Ok(warp::reply::json(&publish_results))
-                }
-                Err(e) => {
-                    println!("{:?}", e);
-                    Ok(warp::reply::json(&"Failed to get group members"))
-                }
-            }
-        }
-        Err(e) => {
-            println!("Unable to connect to RabbitMQ: {:?}", e);
-            Ok(warp::reply::json(&"Unable to connect to RabbitMQ"))
-        }
-    }
 }
 
 // Serve Swagger UI assets

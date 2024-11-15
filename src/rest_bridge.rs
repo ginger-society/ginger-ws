@@ -24,7 +24,8 @@ use IAMService::{
         (status = 200, description = "Message sent"),
         (status = 404, description = "Channel not found")
     ),
-    security(("bearerAuth" = []))  // Referencing the security scheme
+    security(("bearerAuth" = [])),  // Referencing the security scheme
+    tag = "default"
 )]
 pub async fn publish_message(
     channel_name: String,
@@ -77,7 +78,8 @@ pub async fn publish_message(
         (status = 200, description = "Message sent"),
         (status = 404, description = "Channel not found")
     ),
-    security(("apiBearerAuth" = []))  // Referencing the security scheme
+    security(("apiBearerAuth" = [])),  // Referencing the security scheme
+    tag = "default"
 )]
 pub async fn publish_message_to_group(
     group_id: String,

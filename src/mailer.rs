@@ -15,7 +15,8 @@ use ginger_shared_rs::ISCClaims;
     responses(
         (status = 200, description = "Email sent"),
     ),
-    security(("apiISCBearerAuth" = []))  // Referencing the security scheme
+    security(("apiISCBearerAuth" = [])),  // Referencing the security scheme
+    tag = "default"
 )]
 pub async fn send_email(
     email_request: EmailRequest,

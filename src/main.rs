@@ -1,6 +1,7 @@
 use crate::mailer::__path_send_email;
 use crate::rest_bridge::{__path_publish_message, __path_publish_message_to_group};
 
+use auth_helpers::{handle_ws_upgrade, user_authenticated};
 use futures::sink::SinkExt;
 use futures::StreamExt;
 use ginger_shared_rs::rocket_utils::APIClaims;
@@ -11,11 +12,14 @@ use lapin::Error as LapinError;
 use lapin::{
     options::{BasicAckOptions, BasicConsumeOptions},
     Channel as RabbitChannel,
-}; // Renaming lapin::Channel to RabbitChannel
+};
+use prom_helpers::{REGISTRY, REQUEST_COUNTER};
+// Renaming lapin::Channel to RabbitChannel
 use prometheus::{Encoder, IntCounter, Opts, Registry, TextEncoder};
 use requests::EmailRequest;
 use requests::PublishRequest;
 use requests::RabbitMessage;
+use responses::JWTError;
 use rest_bridge::publish_message;
 use rest_bridge::publish_message_to_group;
 use shared::connect_rabbitmq;
@@ -34,23 +38,15 @@ use warp::{
     ws::{Message, WebSocket},
 };
 
+mod auth_helpers;
 mod mailer;
+mod prom_helpers;
 mod requests;
+mod responses;
 mod rest_bridge;
 mod shared;
 use crate::mailer::send_email;
 use crate::shared::Channel;
-
-// Create a registry to hold the metrics
-lazy_static::lazy_static! {
-    static ref REGISTRY: Registry = Registry::new();
-}
-
-// Define metrics
-lazy_static::lazy_static! {
-    static ref REQUEST_COUNTER: IntCounter = IntCounter::with_opts(Opts::new("request_count", "Total number of requests"))
-        .expect("Counter can be created");
-}
 
 #[derive(Debug)]
 struct EncodeError;
@@ -338,84 +334,6 @@ fn with_channels(
     channels: Channels,
 ) -> impl Filter<Extract = (Channels,), Error = std::convert::Infallible> + Clone {
     warp::any().map(move || channels.clone())
-}
-
-// Handle a new WebSocket connection
-async fn user_connected(ws: WebSocket, channel_name: String, channels: Channels) {
-    let (mut tx, mut rx) = ws.split();
-
-    let (channel_tx, mut channel_rx) = {
-        let mut channels_lock = channels.lock().await;
-        let channel = channels_lock
-            .entry(channel_name.clone())
-            .or_insert_with(|| {
-                let (tx, _) = broadcast::channel(100);
-                Channel {
-                    name: channel_name.clone(),
-                    tx,
-                }
-            });
-
-        (channel.tx.clone(), channel.tx.subscribe())
-    };
-
-    tokio::spawn(async move {
-        while let Some(result) = rx.next().await {
-            if let Ok(msg) = result {
-                if let Ok(text) = msg.to_str() {
-                    let _ = channel_tx.send(text.to_string());
-                }
-            }
-        }
-    });
-
-    tokio::spawn(async move {
-        while let Ok(message) = channel_rx.recv().await {
-            if tx.send(Message::text(message)).await.is_err() {
-                break;
-            }
-        }
-    });
-}
-
-// Custom JWT Error
-#[derive(Debug)]
-struct JWTError;
-
-impl warp::reject::Reject for JWTError {}
-
-async fn handle_ws_upgrade(
-    (ws, channel_name, channels): (warp::ws::Ws, String, Channels),
-) -> Result<impl warp::Reply, Rejection> {
-    Ok(ws.on_upgrade(move |socket| user_connected(socket, channel_name, channels)))
-}
-async fn user_authenticated(
-    channel_name: String,
-    ws: warp::ws::Ws,
-    channels: Channels,
-    token: Option<String>, // Extract token from query parameters
-) -> Result<(warp::ws::Ws, String, Channels), Rejection> {
-    if let Some(token) = token {
-        // No need to trim "Bearer " since the token is expected to be plain
-        let secret = "1234";
-
-        let decoding_key = DecodingKey::from_secret(secret.as_ref());
-        let validation = Validation::new(jsonwebtoken::Algorithm::HS256);
-
-        match decode::<Claims>(&token, &decoding_key, &validation) {
-            Ok(token_data) => {
-                println!("Authenticated user: {:?}", token_data.claims.user_id);
-                Ok((ws, channel_name, channels))
-            }
-            Err(e) => {
-                println!("Unauthorized access attempt : {}", e);
-                Err(warp::reject::custom(JWTError))
-            }
-        }
-    } else {
-        println!("Token query parameter missing");
-        Err(warp::reject::custom(JWTError))
-    }
 }
 
 async fn consume_messages(channels: Channels) {

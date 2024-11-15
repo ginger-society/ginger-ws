@@ -43,7 +43,6 @@ use crate::mailer::send_email;
     components(
         schemas(PublishRequest, EmailRequest)
     ),
-    tags((name = "channels", description = "Channel publishing and WebSocket subscription")),
     modifiers(&SecurityAddon),
 )]
 struct ApiDoc;

@@ -9,7 +9,7 @@ IAMService = {path = "./IAMService_client"}
 aws-config = "1.5.8"
 aws-sdk-ses = "1.48.0"
 futures = "0.3"
-ginger-shared-rs = {version = "0.31.0-nightly.0", organization = "ginger-society"}
+ginger-shared-rs = {version = "0.35.0-nightly.0", organization = "ginger-society"}
 jsonwebtoken = "9.3.0"
 lapin = "2.5.0"
 lazy_static = "1.5.0"

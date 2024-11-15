@@ -1,12 +1,6 @@
 use crate::mailer::__path_send_email;
 use crate::rest_bridge::{__path_publish_message, __path_publish_message_to_group};
-use aws_config::meta::region::RegionProviderChain;
-use aws_config::Region;
-use aws_sdk_ses::types::Body as EmailBody;
-use aws_sdk_ses::types::Content as EmailContent;
-use aws_sdk_ses::types::Destination;
-use aws_sdk_ses::types::Message as EmailMessage;
-use aws_sdk_ses::Client;
+
 use futures::sink::SinkExt;
 use futures::StreamExt;
 use ginger_shared_rs::rocket_utils::APIClaims;
@@ -15,8 +9,8 @@ use ginger_shared_rs::ISCClaims;
 use jsonwebtoken::{decode, DecodingKey, Validation};
 use lapin::Error as LapinError;
 use lapin::{
-    options::{BasicAckOptions, BasicConsumeOptions, BasicPublishOptions},
-    BasicProperties, Channel as RabbitChannel, Connection, ConnectionProperties,
+    options::{BasicAckOptions, BasicConsumeOptions},
+    Channel as RabbitChannel,
 }; // Renaming lapin::Channel to RabbitChannel
 use prometheus::{Encoder, IntCounter, Opts, Registry, TextEncoder};
 use requests::EmailRequest;
@@ -24,7 +18,6 @@ use requests::PublishRequest;
 use requests::RabbitMessage;
 use rest_bridge::publish_message;
 use rest_bridge::publish_message_to_group;
-use serde::{Deserialize, Serialize};
 use shared::connect_rabbitmq;
 use shared::Channels;
 use std::collections::HashMap;
@@ -32,8 +25,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 use tokio::time::{sleep, Duration};
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, Http, HttpAuthScheme, SecurityScheme};
-use utoipa::{openapi, Modify};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::{Modify, OpenApi};
 use utoipa_swagger_ui::Config;
 use warp::reject::Reject;
 use warp::Filter;
@@ -41,10 +33,7 @@ use warp::{
     reject::Rejection,
     ws::{Message, WebSocket},
 };
-use IAMService::apis::default_api::{
-    identity_get_group_members_ids, identity_get_group_members_ids_user_land,
-    IdentityGetGroupMembersIdsParams, IdentityGetGroupMembersIdsUserLandParams,
-};
+
 mod mailer;
 mod requests;
 mod rest_bridge;

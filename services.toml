@@ -1,26 +1,35 @@
-dir = "."
 lang = "Rust"
 organization_id = "ginger-society"
-service_type = "RPCEndpoint"
+dir = "."
 spec_url = "/notification/api-doc.json"
+service_type = "RPCEndpoint"
 
 [services."@ginger-society/IAMService"]
-dev = "http://localhost:8080/iam"
+prod_k8 = "http://iam-service-api-service/iam"
 stage = "https://api-staging.gingersociety.org/iam"
+dev = "http://localhost:8080/iam"
 stage_k8 = "http://iam-service-api-service/iam"
+prod = "https://api.gingersociety.org/iam"
 
 [portals_refs]
 
+[ws_refs."@ginger-society/IAMService"]
+prod = ""
+stage_k8 = ""
+dev = ""
+stage = ""
+prod_k8 = ""
+
 [urls]
-dev = "http://localhost:3030"
-prod = "http://localhost:3030"
-prod_k8 = "http://localhost:3030"
+prod = "https://api.gingersociety.org"
 stage = "https://api-staging.gingersociety.org"
+dev = "http://localhost:3030"
 stage_k8 = "http://notification-service-service"
+prod_k8 = "http://notification-service-service"
 
 [urls_ws]
-dev = "wss://api-staging.gingersociety.org/notification" # for testing , use the staging env , for debugging use ws://localhost:3030/notification
-prod = "wss://api.gingersociety.org/notification" 
-prod_k8 = "ws://notification-service-service/notification" 
-stage = "wss://api-staging.gingersociety.org/notification" 
 stage_k8 = "ws://notification-service-service/notification"
+prod_k8 = "ws://notification-service-service/notification"
+prod = "wss://api.gingersociety.org/notification"
+stage = "wss://api-staging.gingersociety.org/notification"
+dev = "wss://api-staging.gingersociety.org/notification"

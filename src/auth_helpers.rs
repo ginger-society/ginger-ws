@@ -69,16 +69,20 @@ pub async fn user_authenticated(
         let decoding_key = DecodingKey::from_secret(secret.as_ref());
         let validation = Validation::new(jsonwebtoken::Algorithm::HS256);
 
-        match decode::<Claims>(&token, &decoding_key, &validation) {
-            Ok(token_data) => {
-                println!("Authenticated user: {:?}", token_data.claims.user_id);
-                Ok((ws, channel_name, channels))
-            }
-            Err(e) => {
-                println!("Unauthorized access attempt : {}", e);
-                Err(warp::reject::custom(JWTError))
-            }
+        // Try decoding as `Claims`
+        if let Ok(token_data) = decode::<Claims>(&token, &decoding_key, &validation) {
+            println!("Authenticated user: {:?}", token_data.claims.user_id);
+            return Ok((ws, channel_name, channels));
         }
+
+        // Try decoding as `APIClaims`
+        if let Ok(token_data) = decode::<APIClaims>(&token, &decoding_key, &validation) {
+            println!("Authenticated API user: {:?}", token_data.claims.sub);
+            return Ok((ws, channel_name, channels));
+        }
+
+        println!("Unauthorized access attempt");
+        Err(warp::reject::custom(JWTError))
     } else {
         println!("Token query parameter missing");
         Err(warp::reject::custom(JWTError))

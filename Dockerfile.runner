@@ -1,0 +1,11 @@
+FROM containers.gingersociety.org/rust-rocket-api-runner:latest
+
+# Copy the compiled binary from the builder stage
+RUN cp /app/target/release/ProvisionerService /app/
+
+# Set the working directory
+WORKDIR /app
+
+
+# Run the executable when the container starts
+ENTRYPOINT ["./ProvisionerService"]

@@ -3,7 +3,8 @@ use utoipa::ToSchema;
 
 #[derive(Deserialize, Serialize, ToSchema)]
 pub struct PublishRequest {
-    pub message: String, // Only the message is in the body
+    pub message: String,
+    pub prefix: String,
 }
 
 #[derive(Deserialize, Serialize, ToSchema)]

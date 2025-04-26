@@ -48,7 +48,7 @@ async fn publish_message_to_group_api_land_internal(
 
                     for id in ids {
                         let rabbit_message = RabbitMessage {
-                            channel_id: id.clone().to_string(),
+                            channel_id: format!("{}_{}", publish_request.prefix,  id.clone().to_string()),
                             message: publish_request.message.clone(),
                         };
 
@@ -123,7 +123,7 @@ async fn publish_message_to_group_isc_internal(
 
                     for id in ids {
                         let rabbit_message = RabbitMessage {
-                            channel_id: id.clone().to_string(),
+                            channel_id: format!("{}_{}", publish_request.prefix,  id.clone().to_string()),
                             message: publish_request.message.clone(),
                         };
 

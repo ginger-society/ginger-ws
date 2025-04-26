@@ -1,7 +1,7 @@
 use ginger_shared_rs::{rocket_utils::{APIClaims, Claims}, ISCClaims};
 
 use crate::{
-    requests::{PublishRequest, RabbitMessage},
+    requests::{PublishRequest, PublishType, RabbitMessage},
     shared::{connect_rabbitmq, Channels},
 };
 use lapin::{
@@ -20,14 +20,11 @@ use IAMService::{
     get_configuration,
 };
 
-
-// For API Land
 async fn publish_message_to_group_api_land_internal(
     group_id: String,
     publish_request: PublishRequest,
     auth_header: String,
 ) -> Result<impl warp::Reply, warp::Rejection> {
-    // Connect to RabbitMQ using the connection pool
     let rabbit_channel_result = connect_rabbitmq().await;
 
     match rabbit_channel_result {
@@ -36,55 +33,98 @@ async fn publish_message_to_group_api_land_internal(
 
             let iam_config = get_configuration(Some(auth_header.clone()));
 
-            // For API land
-            match identity_get_group_members_ids_api_land(
-                &iam_config,
-                IdentityGetGroupMembersIdsApiLandParams {
-                    group_identifier: group_id,
-                },
-            ).await {
-                Ok(ids) => {
+            match publish_request.pubType {
+                PublishType::Group => {
                     let mut publish_results = vec![];
 
-                    for id in ids {
-                        let rabbit_message = RabbitMessage {
-                            channel_id: format!("{}_{}", publish_request.prefix,  id.clone().to_string()),
-                            message: publish_request.message.clone(),
-                        };
+                    let rabbit_message = RabbitMessage {
+                        channel_id: format!("{}_{}", publish_request.prefix, group_id),
+                        message: publish_request.message.clone(),
+                    };
 
-                        let publish_result = rabbit_channel
-                            .basic_publish(
-                                "real-time-updates",
-                                "",
-                                BasicPublishOptions::default(),
-                                &serde_json::to_string(&rabbit_message).unwrap().into_bytes(),
-                                BasicProperties::default(),
-                            )
-                            .await;
+                    let publish_result = rabbit_channel
+                        .basic_publish(
+                            "real-time-updates",
+                            "",
+                            BasicPublishOptions::default(),
+                            &serde_json::to_string(&rabbit_message).unwrap().into_bytes(),
+                            BasicProperties::default(),
+                        )
+                        .await;
 
-                        match publish_result {
-                            Ok(_) => {
-                                println!("Message successfully sent to RabbitMQ for ID: {}", id);
-                                publish_results.push(format!("Message sent for ID: {}", id));
-                            }
-                            Err(e) => {
-                                println!(
-                                    "Failed to send message to RabbitMQ for ID: {}: {:?}",
-                                    id, e
-                                );
-                                publish_results.push(format!(
-                                    "Failed to send message for ID: {}: {:?}",
-                                    id, e
-                                ));
-                            }
+                    match publish_result {
+                        Ok(_) => {
+                            println!("Message successfully sent to RabbitMQ for Group: {}", group_id);
+                            publish_results.push(format!("Message sent for Group: {}", group_id));
+                        }
+                        Err(e) => {
+                            println!(
+                                "Failed to send message to RabbitMQ for Group: {}: {:?}",
+                                group_id, e
+                            );
+                            publish_results.push(format!(
+                                "Failed to send message for Group: {}: {:?}",
+                                group_id, e
+                            ));
                         }
                     }
 
+                    // 🛠️ YOU FORGOT THIS:
                     Ok(warp::reply::json(&publish_results))
                 }
-                Err(e) => {
-                    println!("Failed to get group members (API Land): {:?}", e);
-                    Ok(warp::reply::json(&"Failed to get group members"))
+                PublishType::Members => {
+                    match identity_get_group_members_ids_api_land(
+                        &iam_config,
+                        IdentityGetGroupMembersIdsApiLandParams {
+                            group_identifier: group_id,
+                        },
+                    )
+                    .await
+                    {
+                        Ok(ids) => {
+                            let mut publish_results = vec![];
+
+                            for id in ids {
+                                let rabbit_message = RabbitMessage {
+                                    channel_id: format!("{}_{}", publish_request.prefix, id.clone()),
+                                    message: publish_request.message.clone(),
+                                };
+
+                                let publish_result = rabbit_channel
+                                    .basic_publish(
+                                        "real-time-updates",
+                                        "",
+                                        BasicPublishOptions::default(),
+                                        &serde_json::to_string(&rabbit_message).unwrap().into_bytes(),
+                                        BasicProperties::default(),
+                                    )
+                                    .await;
+
+                                match publish_result {
+                                    Ok(_) => {
+                                        println!("Message successfully sent to RabbitMQ for ID: {}", id);
+                                        publish_results.push(format!("Message sent for ID: {}", id));
+                                    }
+                                    Err(e) => {
+                                        println!(
+                                            "Failed to send message to RabbitMQ for ID: {}: {:?}",
+                                            id, e
+                                        );
+                                        publish_results.push(format!(
+                                            "Failed to send message for ID: {}: {:?}",
+                                            id, e
+                                        ));
+                                    }
+                                }
+                            }
+
+                            Ok(warp::reply::json(&publish_results))
+                        }
+                        Err(e) => {
+                            println!("Failed to get group members (API Land): {:?}", e);
+                            Ok(warp::reply::json(&"Failed to get group members"))
+                        }
+                    }
                 }
             }
         }
@@ -102,7 +142,6 @@ async fn publish_message_to_group_isc_internal(
     publish_request: PublishRequest,
     auth_header: String,
 ) -> Result<impl warp::Reply, warp::Rejection> {
-    // Connect to RabbitMQ using the connection pool
     let rabbit_channel_result = connect_rabbitmq().await;
 
     match rabbit_channel_result {
@@ -111,55 +150,99 @@ async fn publish_message_to_group_isc_internal(
 
             let iam_config = get_configuration(Some(auth_header.clone()));
 
-            // For ISC
-            match identity_get_group_members_ids(
-                &iam_config,
-                IdentityGetGroupMembersIdsParams {
-                    group_identifier: group_id,
-                },
-            ).await {
-                Ok(ids) => {
+            match publish_request.pubType {
+                PublishType::Group => {
+                    // Publish one message to the group
+                    let rabbit_message = RabbitMessage {
+                        channel_id: format!("{}_{}", publish_request.prefix, group_id),
+                        message: publish_request.message.clone(),
+                    };
+
+                    let publish_result = rabbit_channel
+                        .basic_publish(
+                            "real-time-updates",
+                            "",
+                            BasicPublishOptions::default(),
+                            &serde_json::to_string(&rabbit_message).unwrap().into_bytes(),
+                            BasicProperties::default(),
+                        )
+                        .await;
+
                     let mut publish_results = vec![];
 
-                    for id in ids {
-                        let rabbit_message = RabbitMessage {
-                            channel_id: format!("{}_{}", publish_request.prefix,  id.clone().to_string()),
-                            message: publish_request.message.clone(),
-                        };
-
-                        let publish_result = rabbit_channel
-                            .basic_publish(
-                                "real-time-updates",
-                                "",
-                                BasicPublishOptions::default(),
-                                &serde_json::to_string(&rabbit_message).unwrap().into_bytes(),
-                                BasicProperties::default(),
-                            )
-                            .await;
-
-                        match publish_result {
-                            Ok(_) => {
-                                println!("Message successfully sent to RabbitMQ for ID: {}", id);
-                                publish_results.push(format!("Message sent for ID: {}", id));
-                            }
-                            Err(e) => {
-                                println!(
-                                    "Failed to send message to RabbitMQ for ID: {}: {:?}",
-                                    id, e
-                                );
-                                publish_results.push(format!(
-                                    "Failed to send message for ID: {}: {:?}",
-                                    id, e
-                                ));
-                            }
+                    match publish_result {
+                        Ok(_) => {
+                            println!("Message successfully sent to RabbitMQ for Group: {}", group_id);
+                            publish_results.push(format!("Message sent for Group: {}", group_id));
+                        }
+                        Err(e) => {
+                            println!(
+                                "Failed to send message to RabbitMQ for Group: {}: {:?}",
+                                group_id, e
+                            );
+                            publish_results.push(format!(
+                                "Failed to send message for Group: {}: {:?}",
+                                group_id, e
+                            ));
                         }
                     }
 
                     Ok(warp::reply::json(&publish_results))
                 }
-                Err(e) => {
-                    println!("Failed to get group members (ISC): {:?}", e);
-                    Ok(warp::reply::json(&"Failed to get group members"))
+                PublishType::Members => {
+                    // Get member IDs and send individual messages
+                    match identity_get_group_members_ids(
+                        &iam_config,
+                        IdentityGetGroupMembersIdsParams {
+                            group_identifier: group_id,
+                        },
+                    )
+                    .await
+                    {
+                        Ok(ids) => {
+                            let mut publish_results = vec![];
+
+                            for id in ids {
+                                let rabbit_message = RabbitMessage {
+                                    channel_id: format!("{}_{}", publish_request.prefix, id),
+                                    message: publish_request.message.clone(),
+                                };
+
+                                let publish_result = rabbit_channel
+                                    .basic_publish(
+                                        "real-time-updates",
+                                        "",
+                                        BasicPublishOptions::default(),
+                                        &serde_json::to_string(&rabbit_message).unwrap().into_bytes(),
+                                        BasicProperties::default(),
+                                    )
+                                    .await;
+
+                                match publish_result {
+                                    Ok(_) => {
+                                        println!("Message successfully sent to RabbitMQ for ID: {}", id);
+                                        publish_results.push(format!("Message sent for ID: {}", id));
+                                    }
+                                    Err(e) => {
+                                        println!(
+                                            "Failed to send message to RabbitMQ for ID: {}: {:?}",
+                                            id, e
+                                        );
+                                        publish_results.push(format!(
+                                            "Failed to send message for ID: {}: {:?}",
+                                            id, e
+                                        ));
+                                    }
+                                }
+                            }
+
+                            Ok(warp::reply::json(&publish_results))
+                        }
+                        Err(e) => {
+                            println!("Failed to get group members (ISC): {:?}", e);
+                            Ok(warp::reply::json(&"Failed to get group members"))
+                        }
+                    }
                 }
             }
         }

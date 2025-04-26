@@ -2,9 +2,16 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 #[derive(Deserialize, Serialize, ToSchema)]
+pub enum PublishType{
+    Group,
+    Members
+}
+
+#[derive(Deserialize, Serialize, ToSchema)]
 pub struct PublishRequest {
     pub message: String,
     pub prefix: String,
+    pub pubType: PublishType
 }
 
 #[derive(Deserialize, Serialize, ToSchema)]

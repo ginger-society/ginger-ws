@@ -1,5 +1,5 @@
 use crate::mailer::__path_send_email;
-use crate::rest_bridge::{__path_publish_message, __path_publish_message_to_group};
+use crate::rest_bridge::{__path_publish_message, __path_publish_message_userland, __path_publish_message_to_group};
 
 use auth_helpers::{
     handle_ws_upgrade, user_authenticated, with_api_auth, with_auth, with_get_api_auth_header,
@@ -15,6 +15,7 @@ use requests::EmailRequest;
 use requests::PublishRequest;
 use rest_bridge::publish_message;
 use rest_bridge::publish_message_to_group;
+use rest_bridge::publish_message_userland;
 use shared::with_channels;
 use shared::Channels;
 use std::collections::HashMap;
@@ -88,13 +89,26 @@ async fn main() {
 
     let channels_rest = channels.clone();
     let publish_route = warp::path("notification")
-        .and(warp::path!("channels" / String / "publish"))
+        .and(warp::path!("user-land/channels" / String / "publish"))
         .and(warp::post())
         .and(warp::body::json())
         .and(with_auth()) // Add authentication here
         .and(with_get_auth_header())
         .and(with_channels(channels_rest))
+        .and_then(publish_message_userland);
+    
+
+    let channels_rest = channels.clone();
+    let publish_via_isc_route = warp::path("notification")
+        .and(warp::path!("channels" / String / "publish"))
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(with_isc_api_auth()) // Add authentication here
+        .and(with_get_auth_header())
+        .and(with_channels(channels_rest))
         .and_then(publish_message);
+    
+    
 
     let channels_rest = channels.clone();
     let group_publish_route = warp::path("notification")
@@ -132,6 +146,7 @@ async fn main() {
     // Combine all routes
     let routes = websocket_route
         .or(publish_route)
+        .or(publish_via_isc_route)
         .or(group_publish_route)
         .or(api_doc)
         .or(send_email_route)

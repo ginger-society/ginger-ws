@@ -1,4 +1,4 @@
-use ginger_shared_rs::rocket_utils::{APIClaims, Claims};
+use ginger_shared_rs::{rocket_utils::{APIClaims, Claims}, ISCClaims};
 
 use crate::{
     requests::{PublishRequest, RabbitMessage},
@@ -13,39 +13,23 @@ use IAMService::{
     get_configuration,
 };
 
-#[utoipa::path(
-    post,
-    path = "/notification/channels/{channel_name}/publish",
-    params(
-        ("channel_name" = String, Path, description = "The name of the channel to publish to")
-    ),
-    request_body = PublishRequest,
-    responses(
-        (status = 200, description = "Message sent"),
-        (status = 404, description = "Channel not found")
-    ),
-    security(("bearerAuth" = [])),  // Referencing the security scheme
-    tag = "default"
-)]
-pub async fn publish_message(
+
+
+
+async fn publish_message_internal(
     channel_name: String,
     publish_request: PublishRequest,
-    claims: Claims, // Add claims from JWT here
-    auth_header: String,
-    _channels: Channels,
 ) -> Result<impl warp::Reply, warp::Rejection> {
     if let Ok(rabbit_channel) = connect_rabbitmq().await {
-        // let payload = publish_request.message.clone().into_bytes();
-
         let rabbit_message = RabbitMessage {
-            channel_id: channel_name.clone(), // channel_id from the path
-            message: publish_request.message.clone(),
+            channel_id: channel_name,
+            message: publish_request.message,
         };
 
         match rabbit_channel
             .basic_publish(
-                "real-time-updates", // Exchange name
-                "",                  // Routing key
+                "real-time-updates",
+                "",
                 BasicPublishOptions::default(),
                 &serde_json::to_string(&rabbit_message).unwrap().into_bytes(),
                 BasicProperties::default(),
@@ -65,6 +49,55 @@ pub async fn publish_message(
         println!("Unable to connect to RabbitMQ");
         Ok(warp::reply::json(&"Unable to connect to RabbitMQ"))
     }
+}
+
+#[utoipa::path(
+    post,
+    path = "/notification/channels/{channel_name}/publish",
+    params(
+        ("channel_name" = String, Path, description = "The name of the channel to publish to")
+    ),
+    request_body = PublishRequest,
+    responses(
+        (status = 200, description = "Message sent"),
+        (status = 404, description = "Channel not found")
+    ),
+    security(("bearerAuth" = [])),  // Referencing the security scheme
+    tag = "default"
+)]
+pub async fn publish_message_userland(
+    channel_name: String,
+    publish_request: PublishRequest,
+    _claims: Claims,
+    _auth_header: String,
+    _channels: Channels,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    publish_message_internal(channel_name, publish_request).await
+}
+
+
+#[utoipa::path(
+    post,
+    path = "/notification/user-land/channels/{channel_name}/publish",
+    params(
+        ("channel_name" = String, Path, description = "The name of the channel to publish to")
+    ),
+    request_body = PublishRequest,
+    responses(
+        (status = 200, description = "Message sent"),
+        (status = 404, description = "Channel not found")
+    ),
+    security(("bearerAuth" = [])),  // Referencing the security scheme
+    tag = "default"
+)]
+pub async fn publish_message(
+    channel_name: String,
+    publish_request: PublishRequest,
+    _claims: ISCClaims,
+    _auth_header: String,
+    _channels: Channels,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    publish_message_internal(channel_name, publish_request).await
 }
 
 #[utoipa::path(

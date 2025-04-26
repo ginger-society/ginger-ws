@@ -84,7 +84,7 @@ spec:
         cp -r /workspace/kubeconfig /keys
         export KUBECONFIG=/workspace/kubeconfig/kubeconfig.rackmint.prod.yml
         echo "Rolling out restart"
-        kubectl rollout restart deployment provisioner-service-api-deployment \
+        kubectl rollout restart deployment notification-service-deployment \
           -n default
 
 

@@ -214,7 +214,7 @@ pub async fn publish_message_to_group_api_land(
         (status = 200, description = "Message sent (ISC)"),
         (status = 404, description = "Channel not found (ISC)")
     ),
-    security(("iscBearerAuth" = [])),
+    security(("apiISCBearerAuth" = [])),
     tag = "default"
 )]
 pub async fn publish_message_to_group(

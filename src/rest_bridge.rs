@@ -62,14 +62,13 @@ async fn publish_message_internal(
         (status = 200, description = "Message sent"),
         (status = 404, description = "Channel not found")
     ),
-    security(("bearerAuth" = [])),  // Referencing the security scheme
+    security(("apiISCBearerAuth" = [])),  // Referencing the security scheme
     tag = "default"
 )]
-pub async fn publish_message_userland(
+pub async fn publish_message(
     channel_name: String,
     publish_request: PublishRequest,
-    _claims: Claims,
-    _auth_header: String,
+    _claims: ISCClaims,
     _channels: Channels,
 ) -> Result<impl warp::Reply, warp::Rejection> {
     publish_message_internal(channel_name, publish_request).await
@@ -90,15 +89,16 @@ pub async fn publish_message_userland(
     security(("bearerAuth" = [])),  // Referencing the security scheme
     tag = "default"
 )]
-pub async fn publish_message(
+pub async fn publish_message_userland(
     channel_name: String,
     publish_request: PublishRequest,
-    _claims: ISCClaims,
+    _claims: Claims,
     _auth_header: String,
     _channels: Channels,
 ) -> Result<impl warp::Reply, warp::Rejection> {
     publish_message_internal(channel_name, publish_request).await
 }
+
 
 #[utoipa::path(
     post,

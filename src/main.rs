@@ -40,7 +40,7 @@ use crate::mailer::send_email;
 // Swagger configuration for the REST endpoints
 #[derive(OpenApi)]
 #[openapi(
-    paths(publish_message, publish_message_to_group, send_email),
+    paths(publish_message,publish_message_userland, publish_message_to_group, send_email),
     components(
         schemas(PublishRequest, EmailRequest)
     ),
@@ -89,7 +89,7 @@ async fn main() {
 
     let channels_rest = channels.clone();
     let publish_route = warp::path("notification")
-        .and(warp::path!("user-land/channels" / String / "publish"))
+        .and(warp::path!("user-land" / "channels" / String / "publish"))
         .and(warp::post())
         .and(warp::body::json())
         .and(with_auth()) // Add authentication here
@@ -104,7 +104,6 @@ async fn main() {
         .and(warp::post())
         .and(warp::body::json())
         .and(with_isc_api_auth()) // Add authentication here
-        .and(with_get_auth_header())
         .and(with_channels(channels_rest))
         .and_then(publish_message);
     

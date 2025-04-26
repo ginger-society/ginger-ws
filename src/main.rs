@@ -1,8 +1,8 @@
 use crate::mailer::__path_send_email;
-use crate::rest_bridge::{__path_publish_message, __path_publish_message_userland, __path_publish_message_to_group};
+use crate::rest_bridge::{__path_publish_message, __path_publish_message_userland, __path_publish_message_to_group_api_land, __path_publish_message_to_group};
 
 use auth_helpers::{
-    handle_ws_upgrade, user_authenticated, with_api_auth, with_auth, with_get_api_auth_header,
+    handle_ws_upgrade, user_authenticated, with_api_auth, with_auth, with_get_api_auth_header, with_get_isc_auth_header,
     with_get_auth_header, with_isc_api_auth,
 };
 
@@ -15,6 +15,7 @@ use requests::EmailRequest;
 use requests::PublishRequest;
 use rest_bridge::publish_message;
 use rest_bridge::publish_message_to_group;
+use rest_bridge::publish_message_to_group_api_land;
 use rest_bridge::publish_message_userland;
 use shared::with_channels;
 use shared::Channels;
@@ -40,7 +41,7 @@ use crate::mailer::send_email;
 // Swagger configuration for the REST endpoints
 #[derive(OpenApi)]
 #[openapi(
-    paths(publish_message,publish_message_userland, publish_message_to_group, send_email),
+    paths(publish_message,publish_message_userland, publish_message_to_group, publish_message_to_group_api_land, send_email),
     components(
         schemas(PublishRequest, EmailRequest)
     ),
@@ -110,14 +111,24 @@ async fn main() {
     
 
     let channels_rest = channels.clone();
-    let group_publish_route = warp::path("notification")
+    let group_publish_route_isc = warp::path("notification")
         .and(warp::path!("groups" / String / "publish"))
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(with_isc_api_auth()) // Add authentication here
+        .and(with_get_isc_auth_header())
+        .and(with_channels(channels_rest))
+        .and_then(publish_message_to_group);
+
+    let channels_rest = channels.clone();
+    let group_publish_route = warp::path("notification")
+        .and(warp::path!("api-land" /"groups" / String / "publish"))
         .and(warp::post())
         .and(warp::body::json())
         .and(with_api_auth()) // Add authentication here
         .and(with_get_api_auth_header())
         .and(with_channels(channels_rest))
-        .and_then(publish_message_to_group);
+        .and_then(publish_message_to_group_api_land);
 
     let send_email_route = warp::path("notification")
         .and(warp::path!("send-email"))
@@ -146,6 +157,7 @@ async fn main() {
     let routes = websocket_route
         .or(publish_route)
         .or(publish_via_isc_route)
+        .or(group_publish_route_isc)
         .or(group_publish_route)
         .or(api_doc)
         .or(send_email_route)

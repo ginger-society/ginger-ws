@@ -215,3 +215,21 @@ pub fn with_get_api_auth_header(
         }
     })
 }
+
+pub fn with_get_isc_auth_header(
+) -> impl Filter<Extract = (String,), Error = warp::Rejection> + Clone {
+    warp::header::<String>("X-ISC-API-Authorization").and_then(|auth_header: String| async move {
+        // Extract the token from the header "Authorization: token"
+        let token = auth_header
+            .strip_prefix("Bearer ")
+            .or(Some(auth_header.as_str()))
+            .unwrap_or("");
+
+        if !token.is_empty() {
+            Ok(token.to_string())
+        } else {
+            Err(warp::reject::custom(InvalidTokenError))
+        }
+    })
+}
+

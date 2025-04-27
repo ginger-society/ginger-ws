@@ -43,7 +43,7 @@ use crate::mailer::send_email;
 #[openapi(
     paths(publish_message,publish_message_userland, publish_message_to_group, publish_message_to_group_api_land, send_email),
     components(
-        schemas(PublishRequest, EmailRequest)
+        schemas(PublishRequest, EmailRequest, PublishType)
     ),
     modifiers(&SecurityAddon),
 )]

@@ -13,6 +13,7 @@ use prom_helpers::{metrics_handler, REGISTRY, REQUEST_COUNTER};
 // Renaming lapin::Channel to RabbitChannel
 use requests::EmailRequest;
 use requests::PublishRequest;
+use requests::PublishType;
 use rest_bridge::publish_message;
 use rest_bridge::publish_message_to_group;
 use rest_bridge::publish_message_to_group_api_land;

@@ -2,3 +2,4 @@
 .env
 IAMService_client
 .ginger.tmp
+.DS_Store

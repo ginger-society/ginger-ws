@@ -3,6 +3,8 @@ use tokio::sync::{broadcast, Mutex};
 use lapin::{Channel as RabbitChannel, Connection as LapinConnection, ConnectionProperties};
 use uuid::Uuid;
 use warp::Filter;
+use lapin::options::BasicPublishOptions;
+use lapin::BasicProperties;
 
 #[derive(Debug, Clone)]
 pub struct Channel {
@@ -21,7 +23,8 @@ pub struct WsConnection {          // ← renamed from Connection
 pub struct PendingCall {
     pub correlation_id: String,
     pub reply_to: String,
-    pub callee_connection_id: Uuid,
+    pub callee_channel: String,        // ← channel the call was sent to
+    pub caller_connection_id: Uuid,    // ← who sent the call (to avoid self-notification)
 }
 
 pub type Channels      = Arc<Mutex<HashMap<String, Channel>>>;
@@ -81,4 +84,30 @@ pub async fn connect_rabbitmq() -> Result<RabbitChannel, lapin::Error> {
         .await?;
 
     Ok(channel)
+}
+
+
+
+pub async fn publish_to_rabbitmq(channel_id: &str, message: &str) {
+    let rabbit_message = serde_json::json!({
+        "channel_id": channel_id,
+        "message": message,
+    });
+
+    match connect_rabbitmq().await {
+        Ok(rabbit_channel) => {
+            let _ = rabbit_channel
+                .basic_publish(
+                    "real-time-updates",
+                    "",
+                    BasicPublishOptions::default(),
+                    rabbit_message.to_string().as_bytes(),
+                    BasicProperties::default(),
+                )
+                .await;
+        }
+        Err(e) => {
+            eprintln!("[rabbitmq] failed to publish to '{}': {:?}", channel_id, e);
+        }
+    }
 }

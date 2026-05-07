@@ -1,7 +1,7 @@
 use crate::{
     requests::{WampCalleeDisconnected, WampCalleeOffline, WampEvent, WampPublish},
     responses::JWTError,
-    shared::{Channel, Channels, WsConnection, Connections, PendingCall, PendingCalls},
+    shared::{Channel, Channels, Connections, PendingCall, PendingCalls, WsConnection, publish_to_rabbitmq},
 };
 use futures::{sink::SinkExt, StreamExt};
 use ginger_shared_rs::rocket_utils::Claims;
@@ -9,7 +9,6 @@ use jsonwebtoken::{decode, DecodingKey, Validation};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 use warp::{reject::Rejection, ws::{Message, WebSocket}};
-
 pub async fn user_connected(
     ws: WebSocket,
     channel_name: String,
@@ -48,6 +47,7 @@ pub async fn user_connected(
     let channels_inbound      = channels.clone();
     let pending_calls_inbound = pending_calls.clone();
     let connections_inbound   = connections.clone();
+    let channel_name_inbound  = channel_name.clone();
 
     tokio::spawn(async move {
         while let Some(result) = ws_rx.next().await {
@@ -58,69 +58,61 @@ pub async fn user_connected(
                         let publication_id = rand::random::<u64>();
                         let target_channel = publish.topic.clone();
 
-                        let channels_lock = channels_inbound.lock().await;
+                        let receiver_count = {
+                            let channels_lock = channels_inbound.lock().await;
+                            channels_lock
+                                .get(&target_channel)
+                                .map(|ch| ch.tx.receiver_count())
+                                .unwrap_or(0)
+                        };
 
-                        match channels_lock.get(&target_channel) {
-                            None => {
-                                // channel doesn't exist at all
-                                if let Some(reply_to) = &publish.options.reply_to {
-                                    let offline = WampCalleeOffline {
-                                        message_type: 0,
-                                        error: "callee_offline".to_string(),
-                                        correlation_id: publish.options.correlation_id.clone(),
-                                        topic: target_channel.clone(),
-                                    };
-                                    if let Some(reply_ch) = channels_lock.get(reply_to) {
-                                        let _ = reply_ch.tx.send(
-                                            serde_json::to_string(&offline).unwrap()
-                                        );
-                                    }
-                                }
-                                println!("[ws] PUBLISH to unknown channel '{}'", target_channel);
-                            }
-
-                            Some(ch) if ch.tx.receiver_count() == 0 => {
-                                // channel exists but nobody subscribed
-                                if let Some(reply_to) = &publish.options.reply_to {
-                                    let offline = WampCalleeOffline {
-                                        message_type: 0,
-                                        error: "callee_offline".to_string(),
-                                        correlation_id: publish.options.correlation_id.clone(),
-                                        topic: target_channel.clone(),
-                                    };
-                                    if let Some(reply_ch) = channels_lock.get(reply_to) {
-                                        let _ = reply_ch.tx.send(
-                                            serde_json::to_string(&offline).unwrap()
-                                        );
-                                    }
-                                }
-                                println!("[ws] PUBLISH to empty channel '{}'", target_channel);
-                            }
-
-                            Some(ch) => {
-                                // deliver to all subscribers on that channel
-                                let event = WampEvent::from_publish(&publish, publication_id);
-                                let event_str = serde_json::to_string(&event).unwrap();
-                                let _ = ch.tx.send(event_str);
-
+                        if receiver_count == 0 {
+                            // callee offline — notify caller via RabbitMQ
+                            if let Some(reply_to) = &publish.options.reply_to {
+                                let offline = WampCalleeOffline {
+                                    message_type: 0,
+                                    error: "callee_offline".to_string(),
+                                    correlation_id: publish.options.correlation_id.clone(),
+                                    topic: target_channel.clone(),
+                                };
+                                publish_to_rabbitmq(
+                                    reply_to,
+                                    &serde_json::to_string(&offline).unwrap(),
+                                ).await;
                                 println!(
-                                    "[ws] PUBLISH → '{}' pub_id={} receivers={}",
-                                    target_channel, publication_id, ch.tx.receiver_count()
+                                    "[ws] callee_offline on '{}' — notified caller on '{}'",
+                                    target_channel, reply_to
                                 );
+                            } else {
+                                println!("[ws] PUBLISH to offline channel '{}' — no reply_to set", target_channel);
+                            }
 
-                                // track for disconnect detection if RPC-style
-                                if let (Some(corr_id), Some(reply_to)) = (
-                                    publish.options.correlation_id.clone(),
-                                    publish.options.reply_to.clone(),
-                                ) {
-                                    let mut pending = pending_calls_inbound.lock().await;
-                                    pending.insert(corr_id.clone(), PendingCall {
-                                        correlation_id: corr_id.clone(),
-                                        reply_to,
-                                        callee_connection_id: connection_id,
-                                    });
-                                    println!("[ws] pending call tracked corr={}", corr_id);
-                                }
+                        } else {
+                            // callee online — deliver via RabbitMQ so it routes correctly
+                            // even across multiple broker instances
+                            let event = WampEvent::from_publish(&publish, publication_id);
+                            let event_str = serde_json::to_string(&event).unwrap();
+
+                            publish_to_rabbitmq(&target_channel, &event_str).await;
+
+                            println!(
+                                "[ws] PUBLISH → '{}' pub_id={} receivers={}",
+                                target_channel, publication_id, receiver_count
+                            );
+
+                            // track pending call for disconnect detection
+                            if let (Some(corr_id), Some(reply_to)) = (
+                                publish.options.correlation_id.clone(),
+                                publish.options.reply_to.clone(),
+                            ) {
+                                let mut pending = pending_calls_inbound.lock().await;
+                                pending.insert(corr_id.clone(), PendingCall {
+                                    correlation_id: corr_id.clone(),
+                                    reply_to,
+                                    callee_channel: target_channel.clone(),
+                                    caller_connection_id: connection_id,
+                                });
+                                println!("[ws] pending call tracked corr={}", corr_id);
                             }
                         }
 
@@ -135,20 +127,22 @@ pub async fn user_connected(
         // ── client disconnected ───────────────────────────────────────────────
         println!("[ws] connection {} disconnected — running cleanup", connection_id);
 
-        // Step 1: collect orphaned pending calls without holding any other lock
+        // Step 1: collect orphaned calls where this connection was on the callee channel
         let orphaned: Vec<PendingCall> = {
             let pending = pending_calls_inbound.lock().await;
             pending
                 .values()
-                .filter(|pc| pc.callee_connection_id == connection_id)
+                .filter(|pc| {
+                    pc.callee_channel == channel_name_inbound
+                    && pc.caller_connection_id != connection_id
+                })
                 .cloned()
                 .collect()
         };
 
-        // Step 2: notify callers and remove orphaned calls
+        // Step 2: notify callers via RabbitMQ and clean up
         if !orphaned.is_empty() {
-            let mut pending      = pending_calls_inbound.lock().await;
-            let channels_lock    = channels_inbound.lock().await;
+            let mut pending = pending_calls_inbound.lock().await;
 
             for pc in &orphaned {
                 let error = WampCalleeDisconnected {
@@ -157,26 +151,18 @@ pub async fn user_connected(
                     correlation_id: Some(pc.correlation_id.clone()),
                 };
 
-                match channels_lock.get(&pc.reply_to) {
-                    Some(reply_ch) if reply_ch.tx.receiver_count() > 0 => {
-                        let _ = reply_ch.tx.send(serde_json::to_string(&error).unwrap());
-                        println!(
-                            "[ws] notified caller on '{}' — callee_disconnected corr={}",
-                            pc.reply_to, pc.correlation_id
-                        );
-                    }
-                    _ => {
-                        // caller also offline — just clean up silently
-                        println!(
-                            "[ws] caller also offline — dropping corr={}",
-                            pc.correlation_id
-                        );
-                    }
-                }
+                publish_to_rabbitmq(
+                    &pc.reply_to,
+                    &serde_json::to_string(&error).unwrap(),
+                ).await;
+
+                println!(
+                    "[ws] callee_disconnected — notified caller on '{}' corr={}",
+                    pc.reply_to, pc.correlation_id
+                );
 
                 pending.remove(&pc.correlation_id);
             }
-            // both locks drop here
         }
 
         // Step 3: remove from connection registry

@@ -1,5 +1,6 @@
 use crate::mailer::__path_send_email;
 use crate::rest_bridge::{__path_publish_message, __path_publish_message_userland, __path_publish_message_to_group_api_land, __path_publish_message_to_group};
+use crate::shared::{PendingCall, publish_to_rabbitmq};
 
 use auth_helpers::{
     handle_ws_upgrade, user_authenticated, with_api_auth, with_auth,
@@ -75,6 +76,43 @@ async fn main() {
     tokio::spawn(async move {
         consume_messages(channels_clone).await
         // Ensure the block returns `()`
+    });
+
+    // TTL cleanup for stale pending calls
+    let pending_calls_ttl = pending_calls.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+
+            let expired: Vec<PendingCall> = {
+                let pending = pending_calls_ttl.lock().await;
+                pending
+                    .values()
+                    .filter(|pc| pc.created_at.elapsed().as_secs() >= 300)
+                    .cloned()
+                    .collect()
+            };
+
+            if !expired.is_empty() {
+                let mut pending = pending_calls_ttl.lock().await;
+                for pc in &expired {
+                    let error = serde_json::json!({
+                        "message_type": 0,
+                        "error": "call_expired",
+                        "correlation_id": pc.correlation_id,
+                    });
+                    publish_to_rabbitmq(
+                        &pc.reply_to,
+                        &error.to_string(),
+                    ).await;
+                    println!(
+                        "[ttl] call expired — notified caller on '{}' corr={}",
+                        pc.reply_to, pc.correlation_id
+                    );
+                    pending.remove(&pc.correlation_id);
+                }
+            }
+        }
     });
 
     // WebSocket endpoint to subscribe to channels

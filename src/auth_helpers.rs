@@ -1,14 +1,18 @@
 use crate::{
     requests::{WampCalleeDisconnected, WampCalleeOffline, WampEvent, WampPublish},
-    responses::JWTError,
-    shared::{Channel, Channels, Connections, PendingCall, PendingCalls, WsConnection, publish_to_rabbitmq},
+    responses::{InvalidTokenError, JWTError},
+    shared::{
+        publish_to_rabbitmq, Channel, Channels, Connections, PendingCall, PendingCalls,
+        WsConnection,
+    },
 };
 use futures::{sink::SinkExt, StreamExt};
-use ginger_shared_rs::rocket_utils::Claims;
+use ginger_shared_rs::{rocket_utils::{APIClaims, Claims}, ISCClaims};
 use jsonwebtoken::{decode, DecodingKey, Validation};
 use tokio::sync::broadcast;
 use uuid::Uuid;
-use warp::{reject::Rejection, ws::{Message, WebSocket}};
+use warp::{reject::Rejection, ws::{Message, WebSocket}, Filter};
+
 pub async fn user_connected(
     ws: WebSocket,
     channel_name: String,
@@ -29,7 +33,10 @@ pub async fn user_connected(
         });
     }
 
-    println!("[ws] connection {} registered on channel '{}'", connection_id, channel_name);
+    println!(
+        "[ws] connection {} registered on channel '{}'",
+        connection_id, channel_name
+    );
 
     // ── join or create the named channel ──────────────────────────────────────
     let (channel_tx, mut channel_rx) = {
@@ -58,6 +65,27 @@ pub async fn user_connected(
                         let publication_id = rand::random::<u64>();
                         let target_channel = publish.topic.clone();
 
+                        // ── check if this is a result coming back from callee ─
+                        // if kwargs contains is_result: true, resolve the pending call
+                        let is_result = publish.kwargs
+                            .as_ref()
+                            .and_then(|kw| kw.get("is_result"))
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+
+                        if is_result {
+                            if let Some(corr_id) = &publish.options.correlation_id {
+                                let mut pending = pending_calls_inbound.lock().await;
+                                if pending.remove(corr_id).is_some() {
+                                    println!(
+                                        "[ws] pending call resolved corr={}",
+                                        corr_id
+                                    );
+                                }
+                            }
+                        }
+
+                        // ── check receiver count ──────────────────────────────
                         let receiver_count = {
                             let channels_lock = channels_inbound.lock().await;
                             channels_lock
@@ -78,21 +106,23 @@ pub async fn user_connected(
                                 publish_to_rabbitmq(
                                     reply_to,
                                     &serde_json::to_string(&offline).unwrap(),
-                                ).await;
+                                )
+                                .await;
                                 println!(
                                     "[ws] callee_offline on '{}' — notified caller on '{}'",
                                     target_channel, reply_to
                                 );
                             } else {
-                                println!("[ws] PUBLISH to offline channel '{}' — no reply_to set", target_channel);
+                                println!(
+                                    "[ws] PUBLISH to offline channel '{}' — no reply_to set",
+                                    target_channel
+                                );
                             }
 
                         } else {
-                            // callee online — deliver via RabbitMQ so it routes correctly
-                            // even across multiple broker instances
+                            // callee online — deliver via RabbitMQ
                             let event = WampEvent::from_publish(&publish, publication_id);
                             let event_str = serde_json::to_string(&event).unwrap();
-
                             publish_to_rabbitmq(&target_channel, &event_str).await;
 
                             println!(
@@ -100,19 +130,28 @@ pub async fn user_connected(
                                 target_channel, publication_id, receiver_count
                             );
 
-                            // track pending call for disconnect detection
-                            if let (Some(corr_id), Some(reply_to)) = (
-                                publish.options.correlation_id.clone(),
-                                publish.options.reply_to.clone(),
-                            ) {
-                                let mut pending = pending_calls_inbound.lock().await;
-                                pending.insert(corr_id.clone(), PendingCall {
-                                    correlation_id: corr_id.clone(),
-                                    reply_to,
-                                    callee_channel: target_channel.clone(),
-                                    caller_connection_id: connection_id,
-                                });
-                                println!("[ws] pending call tracked corr={}", corr_id);
+                            // track as pending call if RPC-style and not a result
+                            if !is_result {
+                                if let (Some(corr_id), Some(reply_to)) = (
+                                    publish.options.correlation_id.clone(),
+                                    publish.options.reply_to.clone(),
+                                ) {
+                                    let mut pending = pending_calls_inbound.lock().await;
+                                    pending.insert(
+                                        corr_id.clone(),
+                                        PendingCall {
+                                            correlation_id: corr_id.clone(),
+                                            reply_to,
+                                            callee_channel: target_channel.clone(),
+                                            caller_connection_id: connection_id,
+                                            created_at: std::time::Instant::now(),
+                                        },
+                                    );
+                                    println!(
+                                        "[ws] pending call tracked corr={}",
+                                        corr_id
+                                    );
+                                }
                             }
                         }
 
@@ -125,22 +164,25 @@ pub async fn user_connected(
         }
 
         // ── client disconnected ───────────────────────────────────────────────
-        println!("[ws] connection {} disconnected — running cleanup", connection_id);
+        println!(
+            "[ws] connection {} disconnected — running cleanup",
+            connection_id
+        );
 
-        // Step 1: collect orphaned calls where this connection was on the callee channel
+        // Step 1: collect orphaned calls where this connection was the callee
         let orphaned: Vec<PendingCall> = {
             let pending = pending_calls_inbound.lock().await;
             pending
                 .values()
                 .filter(|pc| {
                     pc.callee_channel == channel_name_inbound
-                    && pc.caller_connection_id != connection_id
+                        && pc.caller_connection_id != connection_id
                 })
                 .cloned()
                 .collect()
         };
 
-        // Step 2: notify callers via RabbitMQ and clean up
+        // Step 2: notify callers via RabbitMQ and remove orphaned calls
         if !orphaned.is_empty() {
             let mut pending = pending_calls_inbound.lock().await;
 
@@ -154,7 +196,8 @@ pub async fn user_connected(
                 publish_to_rabbitmq(
                     &pc.reply_to,
                     &serde_json::to_string(&error).unwrap(),
-                ).await;
+                )
+                .await;
 
                 println!(
                     "[ws] callee_disconnected — notified caller on '{}' corr={}",
@@ -182,6 +225,20 @@ pub async fn user_connected(
             }
         }
     });
+}
+
+pub async fn handle_ws_upgrade(
+    (ws, channel_name, channels, connections, pending_calls): (
+        warp::ws::Ws,
+        String,
+        Channels,
+        Connections,
+        PendingCalls,
+    ),
+) -> Result<impl warp::Reply, Rejection> {
+    Ok(ws.on_upgrade(move |socket| {
+        user_connected(socket, channel_name, channels, connections, pending_calls)
+    }))
 }
 
 pub async fn user_authenticated(
@@ -215,29 +272,9 @@ pub async fn user_authenticated(
     }
 }
 
-pub async fn handle_ws_upgrade(
-    (ws, channel_name, channels, connections, pending_calls): (
-        warp::ws::Ws,
-        String,
-        Channels,
-        Connections,
-        PendingCalls,
-    ),
-) -> Result<impl warp::Reply, Rejection> {
-    Ok(ws.on_upgrade(move |socket| {
-        user_connected(socket, channel_name, channels, connections, pending_calls)
-    }))
-}
-
-use ginger_shared_rs::{rocket_utils::APIClaims, ISCClaims};
-use warp::Filter;
-
-use crate::responses::InvalidTokenError;
-
 pub async fn authenticate_token(token: Option<String>) -> Result<Claims, warp::Rejection> {
     if let Some(token) = token {
-        let secret = "1234"; // Use environment variable in production
-
+        let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "1234".to_string());
         let decoding_key = DecodingKey::from_secret(secret.as_ref());
         let validation = Validation::new(jsonwebtoken::Algorithm::HS256);
 
@@ -267,8 +304,7 @@ pub async fn authenticate_isc_api_token(
     token: Option<String>,
 ) -> Result<ISCClaims, warp::Rejection> {
     if let Some(token) = token {
-        let secret = "1234"; // Use environment variable in production
-
+        let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "1234".to_string());
         let decoding_key = DecodingKey::from_secret(secret.as_ref());
         let validation = Validation::new(jsonwebtoken::Algorithm::HS256);
 
@@ -281,10 +317,11 @@ pub async fn authenticate_isc_api_token(
     }
 }
 
-pub async fn authenticate_api_token(token: Option<String>) -> Result<APIClaims, warp::Rejection> {
+pub async fn authenticate_api_token(
+    token: Option<String>,
+) -> Result<APIClaims, warp::Rejection> {
     if let Some(token) = token {
-        let secret = "1234"; // Use environment variable in production
-
+        let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "1234".to_string());
         let decoding_key = DecodingKey::from_secret(secret.as_ref());
         let validation = Validation::new(jsonwebtoken::Algorithm::HS256);
 
@@ -310,7 +347,8 @@ pub fn with_api_auth() -> impl Filter<Extract = (APIClaims,), Error = warp::Reje
     )
 }
 
-pub fn with_isc_api_auth() -> impl Filter<Extract = (ISCClaims,), Error = warp::Rejection> + Clone {
+pub fn with_isc_api_auth(
+) -> impl Filter<Extract = (ISCClaims,), Error = warp::Rejection> + Clone {
     warp::header::optional::<String>("X-ISC-API-Authorization").and_then(
         |auth_header: Option<String>| async move {
             if let Some(token) = auth_header {
@@ -323,14 +361,13 @@ pub fn with_isc_api_auth() -> impl Filter<Extract = (ISCClaims,), Error = warp::
     )
 }
 
-pub fn with_get_auth_header() -> impl Filter<Extract = (String,), Error = warp::Rejection> + Clone {
+pub fn with_get_auth_header(
+) -> impl Filter<Extract = (String,), Error = warp::Rejection> + Clone {
     warp::header::<String>("Authorization").and_then(|auth_header: String| async move {
-        // Extract the token from the header "Authorization: token"
         let token = auth_header
             .strip_prefix("Bearer ")
             .or(Some(auth_header.as_str()))
             .unwrap_or("");
-
         if !token.is_empty() {
             Ok(token.to_string())
         } else {
@@ -342,12 +379,10 @@ pub fn with_get_auth_header() -> impl Filter<Extract = (String,), Error = warp::
 pub fn with_get_api_auth_header(
 ) -> impl Filter<Extract = (String,), Error = warp::Rejection> + Clone {
     warp::header::<String>("X-API-Authorization").and_then(|auth_header: String| async move {
-        // Extract the token from the header "Authorization: token"
         let token = auth_header
             .strip_prefix("Bearer ")
             .or(Some(auth_header.as_str()))
             .unwrap_or("");
-
         if !token.is_empty() {
             Ok(token.to_string())
         } else {
@@ -358,18 +393,17 @@ pub fn with_get_api_auth_header(
 
 pub fn with_get_isc_auth_header(
 ) -> impl Filter<Extract = (String,), Error = warp::Rejection> + Clone {
-    warp::header::<String>("X-ISC-API-Authorization").and_then(|auth_header: String| async move {
-        // Extract the token from the header "Authorization: token"
-        let token = auth_header
-            .strip_prefix("Bearer ")
-            .or(Some(auth_header.as_str()))
-            .unwrap_or("");
-
-        if !token.is_empty() {
-            Ok(token.to_string())
-        } else {
-            Err(warp::reject::custom(InvalidTokenError))
-        }
-    })
+    warp::header::<String>("X-ISC-API-Authorization").and_then(
+        |auth_header: String| async move {
+            let token = auth_header
+                .strip_prefix("Bearer ")
+                .or(Some(auth_header.as_str()))
+                .unwrap_or("");
+            if !token.is_empty() {
+                Ok(token.to_string())
+            } else {
+                Err(warp::reject::custom(InvalidTokenError))
+            }
+        },
+    )
 }
-

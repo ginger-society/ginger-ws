@@ -1,10 +1,10 @@
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{broadcast, Mutex};
 use lapin::{Channel as RabbitChannel, Connection as LapinConnection, ConnectionProperties};
-use uuid::Uuid;
-use warp::Filter;
 use lapin::options::BasicPublishOptions;
 use lapin::BasicProperties;
+use uuid::Uuid;
+use warp::Filter;
 
 #[derive(Debug, Clone)]
 pub struct Channel {
@@ -12,9 +12,8 @@ pub struct Channel {
     pub tx: broadcast::Sender<String>,
 }
 
-/// Per-websocket-connection state for disconnect tracking
 #[derive(Debug, Clone)]
-pub struct WsConnection {          // ← renamed from Connection
+pub struct WsConnection {
     pub id: Uuid,
     pub tx: broadcast::Sender<String>,
 }
@@ -23,13 +22,14 @@ pub struct WsConnection {          // ← renamed from Connection
 pub struct PendingCall {
     pub correlation_id: String,
     pub reply_to: String,
-    pub callee_channel: String,        // ← channel the call was sent to
-    pub caller_connection_id: Uuid,    // ← who sent the call (to avoid self-notification)
+    pub callee_channel: String,
+    pub caller_connection_id: Uuid,
+    pub created_at: std::time::Instant,
 }
 
-pub type Channels      = Arc<Mutex<HashMap<String, Channel>>>;
-pub type Connections   = Arc<Mutex<HashMap<Uuid, WsConnection>>>; 
-pub type PendingCalls  = Arc<Mutex<HashMap<String, PendingCall>>>;
+pub type Channels     = Arc<Mutex<HashMap<String, Channel>>>;
+pub type Connections  = Arc<Mutex<HashMap<Uuid, WsConnection>>>;
+pub type PendingCalls = Arc<Mutex<HashMap<String, PendingCall>>>;
 
 pub fn with_channels(
     channels: Channels,
@@ -85,8 +85,6 @@ pub async fn connect_rabbitmq() -> Result<RabbitChannel, lapin::Error> {
 
     Ok(channel)
 }
-
-
 
 pub async fn publish_to_rabbitmq(channel_id: &str, message: &str) {
     let rabbit_message = serde_json::json!({

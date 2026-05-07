@@ -2,10 +2,10 @@ use crate::mailer::__path_send_email;
 use crate::rest_bridge::{__path_publish_message, __path_publish_message_userland, __path_publish_message_to_group_api_land, __path_publish_message_to_group};
 
 use auth_helpers::{
-    handle_ws_upgrade, user_authenticated, with_api_auth, with_auth, with_get_api_auth_header, with_get_isc_auth_header,
+    handle_ws_upgrade, user_authenticated, with_api_auth, with_auth,
+    with_get_api_auth_header, with_get_isc_auth_header,
     with_get_auth_header, with_isc_api_auth,
 };
-
 use auth_schemas::SecurityAddon;
 
 use message_queue_helpers::consume_messages;
@@ -18,11 +18,14 @@ use rest_bridge::publish_message;
 use rest_bridge::publish_message_to_group;
 use rest_bridge::publish_message_to_group_api_land;
 use rest_bridge::publish_message_userland;
-use shared::with_channels;
-use shared::Channels;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+use shared::{
+    with_channels, with_connections, with_pending_calls,
+    Channels, Connections, PendingCalls,
+};
 
 use utoipa::OpenApi;
 use utoipa_swagger_ui::Config;
@@ -64,6 +67,8 @@ async fn main() {
         .and_then(metrics_handler);
 
     let channels: Channels = Arc::new(Mutex::new(HashMap::new()));
+    let connections: Connections = Arc::new(Mutex::new(HashMap::new()));
+    let pending_calls: PendingCalls = Arc::new(Mutex::new(HashMap::new()));
 
     // Start RabbitMQ consumer
     let channels_clone = channels.clone();
@@ -75,19 +80,26 @@ async fn main() {
     // WebSocket endpoint to subscribe to channels
     let channels_ws = channels.clone();
     // Modify the websocket_route to extract token from query parameters
+
+    let channels_ws = channels.clone();
+    let connections_ws = connections.clone();
+    let pending_calls_ws = pending_calls.clone();
+
     let websocket_route = warp::path("notification")
-        .and(warp::path("ws"))
-        .and(warp::path::param::<String>()) // Channel name
-        .and(warp::ws()) // WebSocket instance
-        .and(warp::query::<HashMap<String, String>>()) // Extract query parameters
-        .and(with_channels(channels_ws)) // Channels
-        .and_then(
-            |channel_name, ws, query_params: HashMap<String, String>, channels| {
-                let token = query_params.get("token").cloned(); // Get token from query params
-                user_authenticated(channel_name, ws, channels, token) // Pass the token
-            },
-        )
-        .and_then(handle_ws_upgrade); // Handle WebSocket upgrade
+    .and(warp::path("ws"))
+    .and(warp::path::param::<String>())
+    .and(warp::ws())
+    .and(warp::query::<HashMap<String, String>>())
+    .and(with_channels(channels_ws))
+    .and(with_connections(connections_ws))
+    .and(with_pending_calls(pending_calls_ws))
+    .and_then(
+        |channel_name, ws, query_params: HashMap<String, String>, channels, connections, pending_calls| {
+            let token = query_params.get("token").cloned();
+            user_authenticated(channel_name, ws, channels, connections, pending_calls, token)
+        },
+    )
+    .and_then(handle_ws_upgrade);
 
     let channels_rest = channels.clone();
     let publish_route = warp::path("notification")

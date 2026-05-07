@@ -20,6 +20,9 @@ tokio = {version = "1", features = ["full"]}
 utoipa = {version = "2", features = ["json"]}
 utoipa-swagger-ui = "2.0"
 warp = "0.3"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
 
 [package.metadata]
 organization = "ginger-society"

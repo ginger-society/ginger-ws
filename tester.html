@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>WebSocket Tester</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body { font-family: monospace; max-width: 860px; margin: 40px auto; padding: 0 20px; background: #1e1e1e; color: #d4d4d4; }
+    h2 { margin: 0 0 16px; font-size: 18px; color: #e0e0e0; }
+
+    .field-label { font-size: 11px; color: #8b949e; margin-bottom: 3px; display: block; }
+    .field-row { margin-bottom: 10px; }
+    .field-row input, .field-row textarea {
+      width: 100%; padding: 7px 10px; font-family: monospace; font-size: 13px;
+      background: #0d1117; border: 1px solid #30363d; border-radius: 5px; color: #d4d4d4;
+    }
+    .field-row input:focus, .field-row textarea:focus { outline: none; border-color: #58a6ff; }
+    .field-row textarea { resize: vertical; min-height: 72px; }
+
+    .row { display: flex; gap: 8px; align-items: flex-end; margin-bottom: 10px; flex-wrap: wrap; }
+    .row .field-row { flex: 1; margin-bottom: 0; }
+
+    button { padding: 7px 14px; border-radius: 5px; border: 1px solid #444; background: #2d2d2d; color: #d4d4d4; cursor: pointer; font-family: monospace; font-size: 13px; white-space: nowrap; }
+    button:hover { background: #383838; }
+    button.primary { background: #0e639c; border-color: #0e639c; color: #fff; }
+    button.primary:hover { background: #1177bb; }
+    button.danger  { background: #8b1a1a; border-color: #c0392b; color: #f28b82; }
+    button.danger:hover { background: #a32d2d; }
+    button.send    { background: #1a3d1a; border-color: #3fb950; color: #3fb950; }
+    button.send:hover { background: #234d23; }
+
+    .status { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: #8b949e; margin-left: 8px; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: #c0392b; transition: background 0.2s; flex-shrink: 0; }
+    .dot.on { background: #3fb950; }
+
+    .sep { border: none; border-top: 1px solid #30363d; margin: 14px 0; }
+
+    .tabs { display: flex; gap: 5px; margin: 14px 0 12px; }
+    .tab { font-size: 12px; padding: 4px 12px; border-radius: 5px; border: 1px solid #30363d; cursor: pointer; color: #8b949e; background: transparent; }
+    .tab:hover { color: #d4d4d4; }
+    .tab.active { border-color: #58a6ff; color: #58a6ff; background: #0d1f38; }
+
+    .pane { display: none; }
+    .pane.active { display: block; }
+
+    .preview-box { background: #0d1117; border: 1px solid #30363d; border-radius: 5px; padding: 7px 10px; font-size: 12px; color: #8b949e; min-height: 36px; white-space: pre-wrap; line-height: 1.5; }
+
+    #log { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 14px; height: 340px; overflow-y: auto; margin-top: 14px; }
+    .msg { margin: 3px 0; font-size: 12px; line-height: 1.6; word-break: break-all; }
+    .info  { color: #58a6ff; }
+    .recv  { color: #3fb950; }
+    .sent  { color: #d29922; }
+    .error { color: #f85149; }
+    .wamp  { color: #79c0ff; }
+  </style>
+</head>
+<body>
+
+<h2>🔌 WebSocket Tester</h2>
+
+<div class="row">
+  <div class="field-row">
+    <span class="field-label">WebSocket URL</span>
+    <input id="url" type="text" value="ws://localhost:3030/notification/ws/my-channel" />
+  </div>
+  <div class="field-row">
+    <span class="field-label">Auth token (appended as ?token=…)</span>
+    <input id="token" type="text" placeholder="eyJ..." />
+  </div>
+</div>
+
+<div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:6px;">
+  <button class="primary" onclick="wsConnect()">Connect</button>
+  <button class="danger"  onclick="wsDisconnect()">Disconnect</button>
+  <button onclick="clearLog()">Clear log</button>
+  <span class="status"><span class="dot" id="dot"></span><span id="status-text">Disconnected</span></span>
+</div>
+
+<hr class="sep">
+
+<div class="tabs">
+  <button class="tab active" onclick="switchTab('raw')"  id="tab-raw">Raw</button>
+  <button class="tab"        onclick="switchTab('wamp')" id="tab-wamp">WAMP publish</button>
+  <button class="tab"        onclick="switchTab('rpc')"  id="tab-rpc">WAMP RPC call</button>
+</div>
+
+<!-- Raw -->
+<div class="pane active" id="pane-raw">
+  <div class="field-row">
+    <span class="field-label">Message — raw string or JSON (Enter to send)</span>
+    <input id="raw-msg" type="text" placeholder='{"event":"hello"}' onkeydown="if(event.key==='Enter') sendRaw()" />
+  </div>
+  <button class="send" onclick="sendRaw()">Send</button>
+</div>
+
+<!-- WAMP publish -->
+<div class="pane" id="pane-wamp">
+  <div class="row">
+    <div class="field-row">
+      <span class="field-label">Topic (target channel)</span>
+      <input id="wamp-topic" type="text" placeholder="123.desktop.info" />
+    </div>
+    <div class="field-row">
+      <span class="field-label">reply_to (optional)</span>
+      <input id="wamp-reply" type="text" placeholder="123.desktop.info" />
+    </div>
+    <div class="field-row">
+      <span class="field-label">correlation_id (optional)</span>
+      <input id="wamp-corr" type="text" placeholder="abc-123" />
+    </div>
+  </div>
+  <div class="row">
+    <div class="field-row">
+      <span class="field-label">args (JSON array)</span>
+      <textarea id="wamp-args" placeholder='[{"user_id":42,"action":"pushed"}]'></textarea>
+    </div>
+    <div class="field-row">
+      <span class="field-label">kwargs (JSON object, optional)</span>
+      <textarea id="wamp-kwargs" placeholder='{"repo":"my-service"}'></textarea>
+    </div>
+  </div>
+  <div style="display:flex; gap:8px;">
+    <button class="send" onclick="sendWamp()">Publish [16]</button>
+    <button onclick="fillWampExample()">Fill example</button>
+  </div>
+</div>
+
+<!-- WAMP RPC -->
+<div class="pane" id="pane-rpc">
+  <div class="row">
+    <div class="field-row">
+      <span class="field-label">Channel (callee is connected here)</span>
+      <input id="rpc-topic" type="text" placeholder="my-procedure" oninput="updateRpcPreview()" />
+    </div>
+    <div class="field-row">
+      <span class="field-label">Function name</span>
+      <input id="rpc-fn" type="text" placeholder="handle_new_message" oninput="updateRpcPreview()" />
+    </div>
+    <div class="field-row">
+      <span class="field-label">reply_to (your result channel)</span>
+      <input id="rpc-reply" type="text" placeholder="my-result" oninput="updateRpcPreview()" />
+    </div>
+  </div>
+  <div class="field-row">
+    <span class="field-label">args (JSON object — extra params for the function)</span>
+    <textarea id="rpc-args" placeholder='{"message_id":"msg-42","from_user":7}' oninput="updateRpcPreview()"></textarea>
+  </div>
+  <div class="field-row">
+    <span class="field-label">Payload preview (kwargs that will be sent)</span>
+    <div class="preview-box" id="rpc-preview">Fill in the fields above to preview the payload.</div>
+  </div>
+  <div style="display:flex; gap:8px; margin-top:4px;">
+    <button class="send" onclick="sendRpcCall()">Call procedure [16]</button>
+    <button onclick="fillRpcExample()">Fill example</button>
+  </div>
+</div>
+
+<div id="log"></div>
+
+<script>
+  let ws = null;
+  let reqId = 1000;
+
+  function log(text, type = 'info') {
+    const box = document.getElementById('log');
+    const t = new Date().toLocaleTimeString();
+    const div = document.createElement('div');
+    div.className = `msg ${type}`;
+    div.textContent = `[${t}] ${text}`;
+    box.appendChild(div);
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function setStatus(connected) {
+    document.getElementById('dot').className = 'dot' + (connected ? ' on' : '');
+    document.getElementById('status-text').textContent = connected ? 'Connected' : 'Disconnected';
+  }
+
+  function wsConnect() {
+    let url = document.getElementById('url').value.trim();
+    const token = document.getElementById('token').value.trim();
+    if (!url) { log('Enter a URL first', 'error'); return; }
+    if (token) url += (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
+
+    if (ws) ws.close();
+    log(`Connecting to ${url}…`);
+
+    ws = new WebSocket(url);
+
+    ws.onopen    = ()  => { setStatus(true);  log('Connected ✓', 'recv'); };
+    ws.onclose   = (e) => { setStatus(false); log(`Disconnected (code ${e.code})`); };
+    ws.onerror   = ()  => { setStatus(false); log('Connection error', 'error'); };
+    ws.onmessage = (e) => {
+      try {
+        const obj = JSON.parse(e.data);
+        if (obj.message_type === 36) {
+          log(`← EVENT [36]  topic=${obj.details?.topic}  pub_id=${obj.publication_id}`, 'wamp');
+          if (obj.args)                    log(`   args:     ${JSON.stringify(obj.args)}`, 'wamp');
+          if (obj.kwargs) {
+            log(`   kwargs:   ${JSON.stringify(obj.kwargs)}`, 'wamp');
+            if (obj.kwargs.function)        log(`   function: ${obj.kwargs.function}`, 'wamp');
+            if (obj.kwargs.correlation_id)  log(`   corr_id:  ${obj.kwargs.correlation_id}`, 'wamp');
+            if (obj.kwargs.reply_to)        log(`   reply_to: ${obj.kwargs.reply_to}`, 'wamp');
+          }
+          if (obj.details?.correlation_id) log(`   corr_id (opts): ${obj.details.correlation_id}`, 'wamp');
+          if (obj.details?.reply_to)       log(`   reply_to (opts): ${obj.details.reply_to}`, 'wamp');
+        } else if (obj.message_type === 0) {
+          log(`← BROKER ERROR: ${obj.error}  topic=${obj.topic || ''}  corr=${obj.correlation_id || ''}`, 'error');
+        } else {
+          log(`← ${e.data}`, 'recv');
+        }
+      } catch (_) {
+        log(`← ${e.data}`, 'recv');
+      }
+    };
+  }
+
+  function wsDisconnect() {
+    if (ws) { ws.close(); ws = null; }
+    else log('Not connected', 'error');
+  }
+
+  function guardSend() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) { log('Not connected', 'error'); return false; }
+    return true;
+  }
+
+  function sendRaw() {
+    if (!guardSend()) return;
+    const input = document.getElementById('raw-msg');
+    const msg = input.value.trim();
+    if (!msg) return;
+    ws.send(msg);
+    log(`→ ${msg}`, 'sent');
+    input.value = '';
+  }
+
+  function sendWamp() {
+    if (!guardSend()) return;
+    const topic   = document.getElementById('wamp-topic').value.trim();
+    const replyTo = document.getElementById('wamp-reply').value.trim();
+    const corrId  = document.getElementById('wamp-corr').value.trim();
+    let args = null, kwargs = null;
+    try { const v = document.getElementById('wamp-args').value.trim();   if (v) args   = JSON.parse(v); } catch { log('args: invalid JSON', 'error'); return; }
+    try { const v = document.getElementById('wamp-kwargs').value.trim(); if (v) kwargs = JSON.parse(v); } catch { log('kwargs: invalid JSON', 'error'); return; }
+
+    const msg = {
+      message_type: 16,
+      request_id: ++reqId,
+      options: {
+        acknowledge: true,
+        ...(replyTo ? { reply_to: replyTo } : {}),
+        ...(corrId  ? { correlation_id: corrId } : {}),
+      },
+      topic,
+      ...(args   ? { args }   : {}),
+      ...(kwargs ? { kwargs } : {}),
+    };
+    ws.send(JSON.stringify(msg));
+    log(`→ PUBLISH [16]  req=${msg.request_id}  topic=${topic}`, 'sent');
+    if (args)   log(`   args:   ${JSON.stringify(args)}`, 'sent');
+    if (kwargs) log(`   kwargs: ${JSON.stringify(kwargs)}`, 'sent');
+  }
+
+  function updateRpcPreview() {
+    const preview = document.getElementById('rpc-preview');
+    const fn      = document.getElementById('rpc-fn').value.trim();
+    const replyTo = document.getElementById('rpc-reply').value.trim();
+    let extra = {};
+    try {
+      const v = document.getElementById('rpc-args').value.trim();
+      if (v) extra = JSON.parse(v);
+      preview.style.color = '#8b949e';
+    } catch {
+      preview.style.color = '#f85149';
+      preview.textContent = 'args: invalid JSON';
+      return;
+    }
+    const payload = {
+      function: fn || '(not set)',
+      correlation_id: 'corr-<auto>',
+      reply_to: replyTo || '(not set)',
+      ...extra,
+    };
+    preview.textContent = JSON.stringify(payload, null, 2);
+  }
+
+  function sendRpcCall() {
+    if (!guardSend()) return;
+    const topic   = document.getElementById('rpc-topic').value.trim();
+    const replyTo = document.getElementById('rpc-reply').value.trim();
+    const fn      = document.getElementById('rpc-fn').value.trim();
+    let extra = {};
+    try {
+      const v = document.getElementById('rpc-args').value.trim();
+      if (v) extra = JSON.parse(v);
+    } catch { log('args: invalid JSON', 'error'); return; }
+
+    if (!topic) { log('Channel (callee) is required', 'error'); return; }
+
+    const corrId = `corr-${Date.now()}`;
+    const kwargs = {
+      ...(fn      ? { function: fn }         : {}),
+      correlation_id: corrId,
+      ...(replyTo ? { reply_to: replyTo }    : {}),
+      ...extra,
+    };
+    const msg = {
+      message_type: 16,
+      request_id: ++reqId,
+      options: { acknowledge: true, reply_to: replyTo, correlation_id: corrId },
+      topic,
+      args: [],
+      kwargs,
+    };
+    ws.send(JSON.stringify(msg));
+    log(`→ RPC CALL [16]  channel=${topic}  fn=${fn || '(none)'}  corr=${corrId}`, 'wamp');
+    log(`   kwargs: ${JSON.stringify(kwargs)}`, 'wamp');
+    if (replyTo) log(`   result expected on: ${replyTo}`, 'wamp');
+  }
+
+  function fillWampExample() {
+    document.getElementById('wamp-topic').value  = '123.desktop.info';
+    document.getElementById('wamp-args').value   = JSON.stringify([{"user_id":42,"action":"pushed","repo":"my-service"}], null, 2);
+    document.getElementById('wamp-reply').value  = '123.desktop.info';
+    document.getElementById('wamp-corr').value   = `corr-${Date.now()}`;
+    document.getElementById('wamp-kwargs').value = '';
+  }
+
+  function fillRpcExample() {
+    document.getElementById('rpc-topic').value = 'my-procedure';
+    document.getElementById('rpc-fn').value    = 'handle_new_message';
+    document.getElementById('rpc-reply').value = 'my-result';
+    document.getElementById('rpc-args').value  = JSON.stringify({"message_id":"msg-42","from_user":7}, null, 2);
+    updateRpcPreview();
+  }
+
+  function switchTab(name) {
+    ['raw','wamp','rpc'].forEach(t => {
+      document.getElementById(`pane-${t}`).classList.toggle('active', t === name);
+      document.getElementById(`tab-${t}`).classList.toggle('active', t === name);
+    });
+  }
+
+  function clearLog() {
+    document.getElementById('log').innerHTML = '';
+  }
+</script>
+</body>
+</html>

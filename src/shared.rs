@@ -1,8 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
-
 use tokio::sync::{broadcast, Mutex};
-
-use lapin::{Channel as RabbitChannel, Connection, ConnectionProperties};
+use lapin::{Channel as RabbitChannel, Connection as LapinConnection, ConnectionProperties};
+use uuid::Uuid;
 use warp::Filter;
 
 #[derive(Debug, Clone)]
@@ -11,23 +10,49 @@ pub struct Channel {
     pub tx: broadcast::Sender<String>,
 }
 
-// Filter to inject channels into the route handlers
+/// Per-websocket-connection state for disconnect tracking
+#[derive(Debug, Clone)]
+pub struct WsConnection {          // ← renamed from Connection
+    pub id: Uuid,
+    pub tx: broadcast::Sender<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingCall {
+    pub correlation_id: String,
+    pub reply_to: String,
+    pub callee_connection_id: Uuid,
+}
+
+pub type Channels      = Arc<Mutex<HashMap<String, Channel>>>;
+pub type Connections   = Arc<Mutex<HashMap<Uuid, WsConnection>>>;  // ← WsConnection
+pub type PendingCalls  = Arc<Mutex<HashMap<String, PendingCall>>>;
+
 pub fn with_channels(
     channels: Channels,
 ) -> impl Filter<Extract = (Channels,), Error = std::convert::Infallible> + Clone {
     warp::any().map(move || channels.clone())
 }
 
-pub type Channels = Arc<Mutex<HashMap<String, Channel>>>;
+pub fn with_connections(
+    connections: Connections,
+) -> impl Filter<Extract = (Connections,), Error = std::convert::Infallible> + Clone {
+    warp::any().map(move || connections.clone())
+}
+
+pub fn with_pending_calls(
+    pending_calls: PendingCalls,
+) -> impl Filter<Extract = (PendingCalls,), Error = std::convert::Infallible> + Clone {
+    warp::any().map(move || pending_calls.clone())
+}
 
 pub async fn connect_rabbitmq() -> Result<RabbitChannel, lapin::Error> {
     let addr = std::env::var("AMPQ_URI")
         .unwrap_or_else(|_| "amqp://user:password@localhost:5672/%2f".to_string());
 
-    let conn = Connection::connect(&addr, ConnectionProperties::default()).await?;
+    let conn = LapinConnection::connect(&addr, ConnectionProperties::default()).await?;
     let channel = conn.create_channel().await?;
 
-    // Declare an exchange if needed
     channel
         .exchange_declare(
             "real-time-updates",
@@ -37,7 +62,6 @@ pub async fn connect_rabbitmq() -> Result<RabbitChannel, lapin::Error> {
         )
         .await?;
 
-    // Declare a queue for consuming messages
     channel
         .queue_declare(
             "real-time-updates-queue",

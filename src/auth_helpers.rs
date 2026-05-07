@@ -1,84 +1,194 @@
-// Handle a new WebSocket connection
 use crate::{
+    requests::{WampCalleeDisconnected, WampCalleeOffline, WampEvent, WampPublish},
     responses::JWTError,
-    shared::{Channel, Channels},
+    shared::{Channel, Channels, WsConnection, Connections, PendingCall, PendingCalls},
 };
-use futures::StreamExt;
+use futures::{sink::SinkExt, StreamExt};
 use ginger_shared_rs::rocket_utils::Claims;
 use jsonwebtoken::{decode, DecodingKey, Validation};
-use tokio::sync::{broadcast, Mutex};
-use warp::{
-    reject::Rejection,
-    ws::{Message, WebSocket},
-};
+use tokio::sync::broadcast;
+use uuid::Uuid;
+use warp::{reject::Rejection, ws::{Message, WebSocket}};
 
-use futures::sink::SinkExt;
+pub async fn user_connected(
+    ws: WebSocket,
+    channel_name: String,
+    channels: Channels,
+    connections: Connections,
+    pending_calls: PendingCalls,
+) {
+    let (mut ws_tx, mut ws_rx) = ws.split();
+    let connection_id = Uuid::new_v4();
 
-pub async fn user_connected(ws: WebSocket, channel_name: String, channels: Channels) {
-    let (mut tx, mut rx) = ws.split();
+    // ── register this connection ──────────────────────────────────────────────
+    let (conn_tx, _) = broadcast::channel::<String>(32);
+    {
+        let mut conns = connections.lock().await;
+        conns.insert(connection_id, WsConnection { id: connection_id, tx: conn_tx.clone() });
+    }
 
+    // ── join or create the named channel ──────────────────────────────────────
     let (channel_tx, mut channel_rx) = {
         let mut channels_lock = channels.lock().await;
         let channel = channels_lock
             .entry(channel_name.clone())
             .or_insert_with(|| {
                 let (tx, _) = broadcast::channel(100);
-                Channel {
-                    name: channel_name.clone(),
-                    tx,
-                }
+                Channel { name: channel_name.clone(), tx }
             });
-
         (channel.tx.clone(), channel.tx.subscribe())
     };
 
+    // ── inbound: client → broker ──────────────────────────────────────────────
+    let channels_inbound = channels.clone();
+    let pending_calls_inbound = pending_calls.clone();
+    let channel_name_inbound = channel_name.clone();
+
     tokio::spawn(async move {
-        while let Some(result) = rx.next().await {
+        while let Some(result) = ws_rx.next().await {
             if let Ok(msg) = result {
                 if let Ok(text) = msg.to_str() {
-                    let _ = channel_tx.send(text.to_string());
+
+                    // ── try WAMP PUBLISH ──────────────────────────────────────
+                    if let Ok(publish) = serde_json::from_str::<WampPublish>(text) {
+                        let publication_id = rand::random::<u64>();
+                        let target_channel = publish.topic.clone();
+
+                        let channels_lock = channels_inbound.lock().await;
+
+                        match channels_lock.get(&target_channel) {
+                            // nobody subscribed to that topic
+                            None => {
+                                if let Some(reply_to) = &publish.options.reply_to {
+                                    let offline = WampCalleeOffline {
+                                        message_type: 0,
+                                        error: "callee_offline".to_string(),
+                                        correlation_id: publish.options.correlation_id.clone(),
+                                        topic: target_channel.clone(),
+                                    };
+                                    if let Some(reply_ch) = channels_lock.get(reply_to) {
+                                        let _ = reply_ch.tx.send(
+                                            serde_json::to_string(&offline).unwrap()
+                                        );
+                                    }
+                                }
+                            }
+
+                            Some(ch) if ch.tx.receiver_count() == 0 => {
+                                // channel exists but no active subscribers
+                                if let Some(reply_to) = &publish.options.reply_to {
+                                    let offline = WampCalleeOffline {
+                                        message_type: 0,
+                                        error: "callee_offline".to_string(),
+                                        correlation_id: publish.options.correlation_id.clone(),
+                                        topic: target_channel.clone(),
+                                    };
+                                    if let Some(reply_ch) = channels_lock.get(reply_to) {
+                                        let _ = reply_ch.tx.send(
+                                            serde_json::to_string(&offline).unwrap()
+                                        );
+                                    }
+                                }
+                            }
+
+                            Some(ch) => {
+                                // at least one subscriber — deliver as WampEvent
+                                // multiple subscribers (multiple tabs/devices) all get it
+                                let event = WampEvent::from_publish(&publish, publication_id);
+                                let event_str = serde_json::to_string(&event).unwrap();
+                                let _ = ch.tx.send(event_str);
+
+                                // track for disconnect detection if this is RPC-style
+                                if let (Some(corr_id), Some(reply_to)) = (
+                                    publish.options.correlation_id.clone(),
+                                    publish.options.reply_to.clone(),
+                                ) {
+                                    let mut pending = pending_calls_inbound.lock().await;
+                                    pending.insert(corr_id.clone(), PendingCall {
+                                        correlation_id: corr_id,
+                                        reply_to,
+                                        callee_connection_id: connection_id,
+                                    });
+                                }
+                            }
+                        }
+
+                    } else {
+                        // ── legacy raw string — broadcast as-is (backwards compat)
+                        let _ = channel_tx.send(text.to_string());
+                    }
                 }
             }
         }
+
+        // ── client disconnected — clean up pending calls ───────────────────────
+        let mut pending = pending_calls_inbound.lock().await;
+        let channels_lock = channels_inbound.lock().await;
+
+        let orphaned: Vec<PendingCall> = pending
+            .values()
+            .filter(|pc| pc.callee_connection_id == connection_id)
+            .cloned()
+            .collect();
+
+        for pc in orphaned {
+            let error = WampCalleeDisconnected {
+                message_type: 0,
+                error: "callee_disconnected".to_string(),
+                correlation_id: Some(pc.correlation_id.clone()),
+            };
+            if let Some(reply_ch) = channels_lock.get(&pc.reply_to) {
+                let _ = reply_ch.tx.send(serde_json::to_string(&error).unwrap());
+            }
+            pending.remove(&pc.correlation_id);
+        }
+
+        // remove from connection registry
+        // (channels_lock already held — drop it first to avoid deadlock)
+        drop(channels_lock);
+        drop(pending);
+        // connections cleanup happens outside
     });
 
+    // ── outbound: broker → this client ───────────────────────────────────────
     tokio::spawn(async move {
         while let Ok(message) = channel_rx.recv().await {
-            if tx.send(Message::text(message)).await.is_err() {
+            if ws_tx.send(Message::text(message)).await.is_err() {
                 break;
             }
         }
     });
+
+    // cleanup connection registry on disconnect
+    let connections_cleanup = connections.clone();
+    tokio::spawn(async move {
+        // this resolves when the inbound task above finishes (client gone)
+        let mut conns = connections_cleanup.lock().await;
+        conns.remove(&connection_id);
+    });
 }
 
-pub async fn handle_ws_upgrade(
-    (ws, channel_name, channels): (warp::ws::Ws, String, Channels),
-) -> Result<impl warp::Reply, Rejection> {
-    Ok(ws.on_upgrade(move |socket| user_connected(socket, channel_name, channels)))
-}
 pub async fn user_authenticated(
     channel_name: String,
     ws: warp::ws::Ws,
     channels: Channels,
-    token: Option<String>, // Extract token from query parameters
-) -> Result<(warp::ws::Ws, String, Channels), Rejection> {
+    connections: Connections,
+    pending_calls: PendingCalls,
+    token: Option<String>,
+) -> Result<(warp::ws::Ws, String, Channels, Connections, PendingCalls), Rejection> {
     if let Some(token) = token {
-        // No need to trim "Bearer " since the token is expected to be plain
-        let secret = "1234";
-
+        let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "1234".to_string());
         let decoding_key = DecodingKey::from_secret(secret.as_ref());
         let validation = Validation::new(jsonwebtoken::Algorithm::HS256);
 
-        // Try decoding as `Claims`
         if let Ok(token_data) = decode::<Claims>(&token, &decoding_key, &validation) {
             println!("Authenticated user: {:?}", token_data.claims.user_id);
-            return Ok((ws, channel_name, channels));
+            return Ok((ws, channel_name, channels, connections, pending_calls));
         }
 
-        // Try decoding as `APIClaims`
         if let Ok(token_data) = decode::<APIClaims>(&token, &decoding_key, &validation) {
             println!("Authenticated API user: {:?}", token_data.claims.sub);
-            return Ok((ws, channel_name, channels));
+            return Ok((ws, channel_name, channels, connections, pending_calls));
         }
 
         println!("Unauthorized access attempt");
@@ -87,6 +197,20 @@ pub async fn user_authenticated(
         println!("Token query parameter missing");
         Err(warp::reject::custom(JWTError))
     }
+}
+
+pub async fn handle_ws_upgrade(
+    (ws, channel_name, channels, connections, pending_calls): (
+        warp::ws::Ws,
+        String,
+        Channels,
+        Connections,
+        PendingCalls,
+    ),
+) -> Result<impl warp::Reply, Rejection> {
+    Ok(ws.on_upgrade(move |socket| {
+        user_connected(socket, channel_name, channels, connections, pending_calls)
+    }))
 }
 
 use ginger_shared_rs::{rocket_utils::APIClaims, ISCClaims};

@@ -24,8 +24,13 @@ pub async fn user_connected(
     let (conn_tx, _) = broadcast::channel::<String>(32);
     {
         let mut conns = connections.lock().await;
-        conns.insert(connection_id, WsConnection { id: connection_id, tx: conn_tx.clone() });
+        conns.insert(connection_id, WsConnection {
+            id: connection_id,
+            tx: conn_tx.clone(),
+        });
     }
+
+    println!("[ws] connection {} registered on channel '{}'", connection_id, channel_name);
 
     // ── join or create the named channel ──────────────────────────────────────
     let (channel_tx, mut channel_rx) = {
@@ -40,16 +45,15 @@ pub async fn user_connected(
     };
 
     // ── inbound: client → broker ──────────────────────────────────────────────
-    let channels_inbound = channels.clone();
+    let channels_inbound      = channels.clone();
     let pending_calls_inbound = pending_calls.clone();
-    let channel_name_inbound = channel_name.clone();
+    let connections_inbound   = connections.clone();
 
     tokio::spawn(async move {
         while let Some(result) = ws_rx.next().await {
             if let Ok(msg) = result {
                 if let Ok(text) = msg.to_str() {
 
-                    // ── try WAMP PUBLISH ──────────────────────────────────────
                     if let Ok(publish) = serde_json::from_str::<WampPublish>(text) {
                         let publication_id = rand::random::<u64>();
                         let target_channel = publish.topic.clone();
@@ -57,8 +61,8 @@ pub async fn user_connected(
                         let channels_lock = channels_inbound.lock().await;
 
                         match channels_lock.get(&target_channel) {
-                            // nobody subscribed to that topic
                             None => {
+                                // channel doesn't exist at all
                                 if let Some(reply_to) = &publish.options.reply_to {
                                     let offline = WampCalleeOffline {
                                         message_type: 0,
@@ -72,10 +76,11 @@ pub async fn user_connected(
                                         );
                                     }
                                 }
+                                println!("[ws] PUBLISH to unknown channel '{}'", target_channel);
                             }
 
                             Some(ch) if ch.tx.receiver_count() == 0 => {
-                                // channel exists but no active subscribers
+                                // channel exists but nobody subscribed
                                 if let Some(reply_to) = &publish.options.reply_to {
                                     let offline = WampCalleeOffline {
                                         message_type: 0,
@@ -89,65 +94,98 @@ pub async fn user_connected(
                                         );
                                     }
                                 }
+                                println!("[ws] PUBLISH to empty channel '{}'", target_channel);
                             }
 
                             Some(ch) => {
-                                // at least one subscriber — deliver as WampEvent
-                                // multiple subscribers (multiple tabs/devices) all get it
+                                // deliver to all subscribers on that channel
                                 let event = WampEvent::from_publish(&publish, publication_id);
                                 let event_str = serde_json::to_string(&event).unwrap();
                                 let _ = ch.tx.send(event_str);
 
-                                // track for disconnect detection if this is RPC-style
+                                println!(
+                                    "[ws] PUBLISH → '{}' pub_id={} receivers={}",
+                                    target_channel, publication_id, ch.tx.receiver_count()
+                                );
+
+                                // track for disconnect detection if RPC-style
                                 if let (Some(corr_id), Some(reply_to)) = (
                                     publish.options.correlation_id.clone(),
                                     publish.options.reply_to.clone(),
                                 ) {
                                     let mut pending = pending_calls_inbound.lock().await;
                                     pending.insert(corr_id.clone(), PendingCall {
-                                        correlation_id: corr_id,
+                                        correlation_id: corr_id.clone(),
                                         reply_to,
                                         callee_connection_id: connection_id,
                                     });
+                                    println!("[ws] pending call tracked corr={}", corr_id);
                                 }
                             }
                         }
 
                     } else {
-                        // ── legacy raw string — broadcast as-is (backwards compat)
+                        // legacy raw string — broadcast to connected channel as-is
                         let _ = channel_tx.send(text.to_string());
                     }
                 }
             }
         }
 
-        // ── client disconnected — clean up pending calls ───────────────────────
-        let mut pending = pending_calls_inbound.lock().await;
-        let channels_lock = channels_inbound.lock().await;
+        // ── client disconnected ───────────────────────────────────────────────
+        println!("[ws] connection {} disconnected — running cleanup", connection_id);
 
-        let orphaned: Vec<PendingCall> = pending
-            .values()
-            .filter(|pc| pc.callee_connection_id == connection_id)
-            .cloned()
-            .collect();
+        // Step 1: collect orphaned pending calls without holding any other lock
+        let orphaned: Vec<PendingCall> = {
+            let pending = pending_calls_inbound.lock().await;
+            pending
+                .values()
+                .filter(|pc| pc.callee_connection_id == connection_id)
+                .cloned()
+                .collect()
+        };
 
-        for pc in orphaned {
-            let error = WampCalleeDisconnected {
-                message_type: 0,
-                error: "callee_disconnected".to_string(),
-                correlation_id: Some(pc.correlation_id.clone()),
-            };
-            if let Some(reply_ch) = channels_lock.get(&pc.reply_to) {
-                let _ = reply_ch.tx.send(serde_json::to_string(&error).unwrap());
+        // Step 2: notify callers and remove orphaned calls
+        if !orphaned.is_empty() {
+            let mut pending      = pending_calls_inbound.lock().await;
+            let channels_lock    = channels_inbound.lock().await;
+
+            for pc in &orphaned {
+                let error = WampCalleeDisconnected {
+                    message_type: 0,
+                    error: "callee_disconnected".to_string(),
+                    correlation_id: Some(pc.correlation_id.clone()),
+                };
+
+                match channels_lock.get(&pc.reply_to) {
+                    Some(reply_ch) if reply_ch.tx.receiver_count() > 0 => {
+                        let _ = reply_ch.tx.send(serde_json::to_string(&error).unwrap());
+                        println!(
+                            "[ws] notified caller on '{}' — callee_disconnected corr={}",
+                            pc.reply_to, pc.correlation_id
+                        );
+                    }
+                    _ => {
+                        // caller also offline — just clean up silently
+                        println!(
+                            "[ws] caller also offline — dropping corr={}",
+                            pc.correlation_id
+                        );
+                    }
+                }
+
+                pending.remove(&pc.correlation_id);
             }
-            pending.remove(&pc.correlation_id);
+            // both locks drop here
         }
 
-        // remove from connection registry
-        // (channels_lock already held — drop it first to avoid deadlock)
-        drop(channels_lock);
-        drop(pending);
-        // connections cleanup happens outside
+        // Step 3: remove from connection registry
+        {
+            let mut conns = connections_inbound.lock().await;
+            conns.remove(&connection_id);
+        }
+
+        println!("[ws] connection {} fully cleaned up", connection_id);
     });
 
     // ── outbound: broker → this client ───────────────────────────────────────
@@ -157,14 +195,6 @@ pub async fn user_connected(
                 break;
             }
         }
-    });
-
-    // cleanup connection registry on disconnect
-    let connections_cleanup = connections.clone();
-    tokio::spawn(async move {
-        // this resolves when the inbound task above finishes (client gone)
-        let mut conns = connections_cleanup.lock().await;
-        conns.remove(&connection_id);
     });
 }
 

@@ -25,7 +25,7 @@ pub struct PendingCall {
 }
 
 pub type Channels      = Arc<Mutex<HashMap<String, Channel>>>;
-pub type Connections   = Arc<Mutex<HashMap<Uuid, WsConnection>>>;  // ← WsConnection
+pub type Connections   = Arc<Mutex<HashMap<Uuid, WsConnection>>>; 
 pub type PendingCalls  = Arc<Mutex<HashMap<String, PendingCall>>>;
 
 pub fn with_channels(

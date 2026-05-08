@@ -1,6 +1,6 @@
 use crate::mailer::__path_send_email;
 use crate::rest_bridge::{__path_publish_message, __path_publish_message_userland, __path_publish_message_to_group_api_land, __path_publish_message_to_group};
-use crate::shared::{PendingCall, publish_to_rabbitmq};
+use crate::shared::{PendingCall, RabbitPool, RabbitPoolRef, publish_to_rabbitmq, with_rabbit};
 
 use auth_helpers::{
     handle_ws_upgrade, user_authenticated, with_api_auth, with_auth,
@@ -75,6 +75,8 @@ async fn main() {
     });
 
     let redis: RedisPool = connect_redis().await;
+    let rabbit_pool: RabbitPoolRef = Arc::new(RabbitPool::new().await);
+
 
 
     // WebSocket endpoint to subscribe to channels
@@ -84,6 +86,7 @@ async fn main() {
     let channels_ws = channels.clone();
     let connections_ws = connections.clone();
     let redis_ws = redis.clone();
+    let rabbit_pool_ws = rabbit_pool.clone();
 
 
     let websocket_route = warp::path("notification")
@@ -94,10 +97,11 @@ async fn main() {
     .and(with_channels(channels_ws))
     .and(with_connections(connections_ws))
     .and(with_redis(redis_ws))
+    .and(with_rabbit(rabbit_pool_ws))
     .and_then(
-        |channel_name, ws, query_params: HashMap<String, String>, channels, connections, pending_calls| {
+        |channel_name, ws, query_params: HashMap<String, String>, channels, connections, redis, rabbit_pool| {
             let token = query_params.get("token").cloned();
-            user_authenticated(channel_name, ws, channels, connections, pending_calls, token)
+            user_authenticated(channel_name, ws, channels, connections, redis, rabbit_pool, token)
         },
     )
     .and_then(handle_ws_upgrade);

@@ -32,6 +32,37 @@ pub type Channels    = Arc<Mutex<HashMap<String, Channel>>>;
 pub type Connections = Arc<Mutex<HashMap<Uuid, WsConnection>>>;
 pub type RedisPool   = Arc<redis::aio::ConnectionManager>;
 
+pub struct RabbitPool {
+    pub channel: Arc<Mutex<RabbitChannel>>,
+}
+
+impl RabbitPool {
+    pub async fn new() -> Self {
+        loop {
+            match connect_rabbitmq().await {
+                Ok(channel) => {                    // ← not a tuple
+                    println!("[rabbitmq] persistent pool established");
+                    return Self {
+                        channel: Arc::new(Mutex::new(channel)),
+                    };
+                }
+                Err(e) => {
+                    eprintln!("[rabbitmq] pool init failed: {:?} — retrying in 5s", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                }
+            }
+        }
+    }
+}
+
+pub type RabbitPoolRef = Arc<RabbitPool>;
+
+pub fn with_rabbit(
+    pool: RabbitPoolRef,
+) -> impl Filter<Extract = (RabbitPoolRef,), Error = std::convert::Infallible> + Clone {
+    warp::any().map(move || pool.clone())
+}
+
 // TTL for pending calls in Redis — 5 minutes
 pub const PENDING_CALL_TTL_SECS: u64 = 300;
 // Redis key prefix
@@ -145,28 +176,20 @@ pub async fn connect_rabbitmq() -> Result<RabbitChannel, lapin::Error> {
     Ok(channel)
 }
 
-pub async fn publish_to_rabbitmq(channel_id: &str, message: &str) {
+pub async fn publish_to_rabbitmq(pool: &RabbitPool, channel_id: &str, message: &str) {
     let rabbit_message = serde_json::json!({
         "channel_id": channel_id,
         "message": message,
     });
 
-    match connect_rabbitmq().await {
-        Ok(rabbit_channel) => {
-            let _ = rabbit_channel
-                .basic_publish(
-                    "real-time-updates",
-                    "",
-                    BasicPublishOptions::default(),
-                    rabbit_message.to_string().as_bytes(),
-                    BasicProperties::default(),
-                )
-                .await;
-        }
-        Err(e) => {
-            eprintln!("[rabbitmq] failed to publish to '{}': {:?}", channel_id, e);
-        }
-    }
+    let ch = pool.channel.lock().await;
+    let _ = ch.basic_publish(
+        "real-time-updates",
+        "",
+        BasicPublishOptions::default(),
+        rabbit_message.to_string().as_bytes(),
+        BasicProperties::default(),
+    ).await;
 }
 
 // ── Redis connection ──────────────────────────────────────────────────────────

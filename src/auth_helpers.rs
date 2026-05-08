@@ -2,9 +2,7 @@ use crate::{
     requests::{WampCalleeDisconnected, WampCalleeOffline, WampEvent, WampPublish},
     responses::{InvalidTokenError, JWTError},
     shared::{
-        pending_call_insert, pending_call_remove, pending_calls_for_channel,
-        publish_to_rabbitmq, Channel, Channels, Connections, PendingCall,
-        RedisPool, WsConnection,
+        Channel, Channels, Connections, PendingCall, RabbitPoolRef, RedisPool, WsConnection, pending_call_insert, pending_call_remove, pending_calls_for_channel, publish_to_rabbitmq
     },
 };
 use futures::{sink::SinkExt, StreamExt};
@@ -20,6 +18,7 @@ pub async fn user_connected(
     channels: Channels,
     connections: Connections,
     redis: RedisPool,
+    rabbit_pool: RabbitPoolRef,
 ) {
     let (mut ws_tx, mut ws_rx) = ws.split();
     let connection_id = Uuid::new_v4();
@@ -96,6 +95,7 @@ pub async fn user_connected(
                                     topic: target_channel.clone(),
                                 };
                                 publish_to_rabbitmq(
+                                    &rabbit_pool, 
                                     reply_to,
                                     &serde_json::to_string(&offline).unwrap(),
                                 ).await;
@@ -113,7 +113,7 @@ pub async fn user_connected(
                         } else {
                             let event = WampEvent::from_publish(&publish, publication_id);
                             let event_str = serde_json::to_string(&event).unwrap();
-                            publish_to_rabbitmq(&target_channel, &event_str).await;
+                            publish_to_rabbitmq(&rabbit_pool, &target_channel, &event_str).await;
 
                             println!(
                                 "[ws] PUBLISH → '{}' pub_id={} receivers={}",
@@ -163,6 +163,7 @@ pub async fn user_connected(
                 correlation_id: Some(pc.correlation_id.clone()),
             };
             publish_to_rabbitmq(
+                &rabbit_pool, 
                 &pc.reply_to,
                 &serde_json::to_string(&error).unwrap(),
             ).await;
@@ -191,27 +192,28 @@ pub async fn user_connected(
 }
 
 pub async fn handle_ws_upgrade(
-    (ws, channel_name, channels, connections, redis): (
+    (ws, channel_name, channels, connections, redis, rabbit_pool): (
         warp::ws::Ws,
         String,
         Channels,
         Connections,
         RedisPool,
+        RabbitPoolRef,
     ),
 ) -> Result<impl warp::Reply, Rejection> {
     Ok(ws.on_upgrade(move |socket| {
-        user_connected(socket, channel_name, channels, connections, redis)
+        user_connected(socket, channel_name, channels, connections, redis, rabbit_pool)
     }))
 }
-
 pub async fn user_authenticated(
     channel_name: String,
     ws: warp::ws::Ws,
     channels: Channels,
     connections: Connections,
     redis: RedisPool,
+    rabbit_pool: RabbitPoolRef,
     token: Option<String>,
-) -> Result<(warp::ws::Ws, String, Channels, Connections, RedisPool), Rejection> {
+) -> Result<(warp::ws::Ws, String, Channels, Connections, RedisPool, RabbitPoolRef), Rejection> {
     if let Some(token) = token {
         let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "1234".to_string());
         let decoding_key = DecodingKey::from_secret(secret.as_ref());
@@ -219,12 +221,12 @@ pub async fn user_authenticated(
 
         if let Ok(token_data) = decode::<Claims>(&token, &decoding_key, &validation) {
             println!("Authenticated user: {:?}", token_data.claims.user_id);
-            return Ok((ws, channel_name, channels, connections, redis));
+            return Ok((ws, channel_name, channels, connections, redis, rabbit_pool));
         }
 
         if let Ok(token_data) = decode::<APIClaims>(&token, &decoding_key, &validation) {
             println!("Authenticated API user: {:?}", token_data.claims.sub);
-            return Ok((ws, channel_name, channels, connections, redis));
+            return Ok((ws, channel_name, channels, connections, redis, rabbit_pool));
         }
 
         println!("Unauthorized access attempt");

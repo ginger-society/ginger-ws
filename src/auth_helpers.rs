@@ -18,6 +18,7 @@ pub async fn user_connected(
     channels: Channels,
     connections: Connections,
     redis: RedisPool,
+    redis_pubsub: RedisPool,
     rabbit_pool: RabbitPoolRef,
 ) {
     let (mut ws_tx, mut ws_rx) = ws.split();
@@ -192,28 +193,31 @@ pub async fn user_connected(
 }
 
 pub async fn handle_ws_upgrade(
-    (ws, channel_name, channels, connections, redis, rabbit_pool): (
+    (ws, channel_name, channels, connections, redis, redis_pubsub, rabbit_pool): (
         warp::ws::Ws,
         String,
         Channels,
         Connections,
-        RedisPool,
+        RedisPool,       
+        RedisPool,       
         RabbitPoolRef,
     ),
 ) -> Result<impl warp::Reply, Rejection> {
     Ok(ws.on_upgrade(move |socket| {
-        user_connected(socket, channel_name, channels, connections, redis, rabbit_pool)
+        user_connected(socket, channel_name, channels, connections, redis, redis_pubsub, rabbit_pool)
     }))
 }
+
 pub async fn user_authenticated(
     channel_name: String,
     ws: warp::ws::Ws,
     channels: Channels,
     connections: Connections,
     redis: RedisPool,
+    redis_pubsub: RedisPool,
     rabbit_pool: RabbitPoolRef,
     token: Option<String>,
-) -> Result<(warp::ws::Ws, String, Channels, Connections, RedisPool, RabbitPoolRef), Rejection> {
+) -> Result<(warp::ws::Ws, String, Channels, Connections, RedisPool, RedisPool, RabbitPoolRef), Rejection> {
     if let Some(token) = token {
         let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "1234".to_string());
         let decoding_key = DecodingKey::from_secret(secret.as_ref());
@@ -221,12 +225,12 @@ pub async fn user_authenticated(
 
         if let Ok(token_data) = decode::<Claims>(&token, &decoding_key, &validation) {
             println!("Authenticated user: {:?}", token_data.claims.user_id);
-            return Ok((ws, channel_name, channels, connections, redis, rabbit_pool));
+            return Ok((ws, channel_name, channels, connections, redis, redis_pubsub, rabbit_pool));
         }
 
         if let Ok(token_data) = decode::<APIClaims>(&token, &decoding_key, &validation) {
             println!("Authenticated API user: {:?}", token_data.claims.sub);
-            return Ok((ws, channel_name, channels, connections, redis, rabbit_pool));
+            return Ok((ws, channel_name, channels, connections, redis, redis_pubsub, rabbit_pool));
         }
 
         println!("Unauthorized access attempt");

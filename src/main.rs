@@ -1,6 +1,6 @@
 use crate::mailer::__path_send_email;
 use crate::rest_bridge::{__path_publish_message, __path_publish_message_userland, __path_publish_message_to_group_api_land, __path_publish_message_to_group};
-use crate::shared::{PendingCall, RabbitPool, RabbitPoolRef, publish_to_rabbitmq, with_rabbit};
+use crate::shared::{PendingCall, RabbitPool, RabbitPoolRef, connect_redis_pubsub_pool, publish_to_rabbitmq, start_redis_pubsub_bridge, with_rabbit};
 
 use auth_helpers::{
     handle_ws_upgrade, user_authenticated, with_api_auth, with_auth,
@@ -59,52 +59,68 @@ async fn main() {
         .unwrap();
 
     // Define the metrics route
+
     let metrics_route = warp::path("notification")
         .and(warp::path("metrics"))
         .and(warp::get())
         .and_then(metrics_handler);
-
-    let channels: Channels = Arc::new(Mutex::new(HashMap::new()));
+    let channels: Channels    = Arc::new(Mutex::new(HashMap::new()));
     let connections: Connections = Arc::new(Mutex::new(HashMap::new()));
 
-    // Start RabbitMQ consumer
-    let channels_clone = channels.clone();
-    tokio::spawn(async move {
-        consume_messages(channels_clone).await
-        // Ensure the block returns `()`
-    });
-
+    // Redis — pending calls
     let redis: RedisPool = connect_redis().await;
+
+    // Redis — pub/sub fan-out
+    let redis_pubsub: RedisPool = connect_redis_pubsub_pool().await;
+
+    // RabbitMQ — persistent publish pool
     let rabbit_pool: RabbitPoolRef = Arc::new(RabbitPool::new().await);
 
+    // start Redis pub/sub bridge
+    // listens on pushkar-redis, delivers to local broadcast::Sender
+    start_redis_pubsub_bridge(channels.clone()).await;
 
+    // start RabbitMQ consumer
+    // exclusive queue per instance, fanout delivers to all instances
+    let channels_mq = channels.clone();
+    tokio::spawn(async move {
+        consume_messages(channels_mq).await;
+    });
 
-    // WebSocket endpoint to subscribe to channels
-    let channels_ws = channels.clone();
-    // Modify the websocket_route to extract token from query parameters
-
-    let channels_ws = channels.clone();
-    let connections_ws = connections.clone();
-    let redis_ws = redis.clone();
-    let rabbit_pool_ws = rabbit_pool.clone();
-
+    let channels_ws     = channels.clone();
+    let connections_ws  = connections.clone();
+    let redis_ws        = redis.clone();
+    let redis_pubsub_ws = redis_pubsub.clone();
+    let rabbit_ws       = rabbit_pool.clone();
 
     let websocket_route = warp::path("notification")
-    .and(warp::path("ws"))
-    .and(warp::path::param::<String>())
-    .and(warp::ws())
-    .and(warp::query::<HashMap<String, String>>())
-    .and(with_channels(channels_ws))
-    .and(with_connections(connections_ws))
-    .and(with_redis(redis_ws))
-    .and(with_rabbit(rabbit_pool_ws))
-    .and_then(
-        |channel_name, ws, query_params: HashMap<String, String>, channels, connections, redis, rabbit_pool| {
-            let token = query_params.get("token").cloned();
-            user_authenticated(channel_name, ws, channels, connections, redis, rabbit_pool, token)
-        },
-    )
-    .and_then(handle_ws_upgrade);
+        .and(warp::path("ws"))
+        .and(warp::path::param::<String>())
+        .and(warp::ws())
+        .and(warp::query::<HashMap<String, String>>())
+        .and(with_channels(channels_ws))
+        .and(with_connections(connections_ws))
+        .and(with_redis(redis_ws))
+        .and(with_redis(redis_pubsub_ws))
+        .and(with_rabbit(rabbit_ws))
+        .and_then(
+            |channel_name,
+            ws,
+            query_params: HashMap<String, String>,
+            channels,
+            connections,
+            redis,
+            redis_pubsub,
+            rabbit_pool| {
+                let token = query_params.get("token").cloned();
+                user_authenticated(
+                    channel_name, ws, channels, connections,
+                    redis, redis_pubsub, rabbit_pool, token,
+                )
+            },
+        )
+        .and_then(handle_ws_upgrade);
+
 
     let channels_rest = channels.clone();
     let publish_route = warp::path("notification")

@@ -43,6 +43,11 @@ pub type RedisPool   = Arc<redis::aio::ConnectionManager>;
 pub const PENDING_CALL_TTL_SECS: u64 = 20;
 const PENDING_KEY: &str = "pending_call:";
 const PENDING_INDEX_KEY: &str = "pending_call_index:";
+pub const BROKER_HEARTBEAT_KEY: &str = "broker:heartbeat:";
+pub const BROKER_SET_KEY: &str = "brokers:active";
+pub const MISS_COUNT_KEY: &str = "callee_miss:";
+pub const MISS_COUNT_TTL_SECS: u64 = 3;
+pub const BROKER_HEARTBEAT_TTL_SECS: u64 = 15;
 // ── warp filters ──────────────────────────────────────────────────────────────
 
 pub fn with_channels(
@@ -484,6 +489,97 @@ pub async fn start_pending_call_expiry_watcher(
 
             eprintln!("[redis-expiry] stream ended — reconnecting in 2s...");
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        }
+    });
+}
+
+
+
+// ── broker registration ───────────────────────────────────────────────────────
+// Call once at startup, then refresh every ~5 s from a background task.
+ 
+pub async fn register_broker(redis: &RedisPool, broker_id: &str) {
+    let mut conn = (**redis).clone();
+    let key = format!("{}{}", BROKER_HEARTBEAT_KEY, broker_id);
+    // heartbeat key — if this broker dies the key expires and it falls out
+    let _: Result<(), _> = conn
+        .set_ex(&key, "1", BROKER_HEARTBEAT_TTL_SECS.try_into().unwrap())
+        .await;
+    // add to set of known brokers
+    let _: Result<(), _> = conn.sadd(BROKER_SET_KEY, broker_id).await;
+}
+ 
+pub async fn unregister_broker(redis: &RedisPool, broker_id: &str) {
+    let mut conn = (**redis).clone();
+    let key = format!("{}{}", BROKER_HEARTBEAT_KEY, broker_id);
+    let _: Result<(), _> = conn.del(&key).await;
+    let _: Result<(), _> = conn.srem(BROKER_SET_KEY, broker_id).await;
+}
+ 
+/// Returns the count of currently alive brokers.
+/// A broker is "alive" if its heartbeat key still exists in Redis.
+pub async fn live_broker_count(redis: &RedisPool) -> u64 {
+    let mut conn = (**redis).clone();
+ 
+    // Read all broker IDs from the set
+    let ids: Vec<String> = match conn.smembers::<_, Vec<String>>(BROKER_SET_KEY).await {
+        Ok(v) => v,
+        Err(_) => return 1, // safe fallback — don't fire false positive
+    };
+ 
+    let mut alive = 0u64;
+    for id in ids {
+        let hb_key = format!("{}{}", BROKER_HEARTBEAT_KEY, id);
+        let exists: bool = conn.exists(&hb_key).await.unwrap_or(false);
+        if exists {
+            alive += 1;
+        } else {
+            // heartbeat expired — clean up the set
+            let _: Result<(), _> = conn.srem(BROKER_SET_KEY, &id).await;
+        }
+    }
+ 
+    alive.max(1) // never return 0 — prevents divide-by-zero / false positives
+}
+ 
+/// Atomically increment the miss counter for a correlation_id.
+/// Returns the new count.  The key is set with MISS_COUNT_TTL_SECS TTL on
+/// first increment so stale counters self-clean if a broker crashes mid-flow.
+pub async fn increment_miss_count(redis: &RedisPool, correlation_id: &str) -> u64 {
+    let key = format!("{}{}", MISS_COUNT_KEY, correlation_id);
+    let mut conn = (**redis).clone();
+ 
+    // INCR is atomic in Redis
+    let count: u64 = conn.incr(&key, 1u64).await.unwrap_or(1);
+ 
+    // Set TTL only on the first increment (count == 1); subsequent INCR calls
+    // on an existing key don't reset the TTL — that's intentional.
+    if count == 1 {
+        let _: Result<(), _> = conn
+            .expire(&key, MISS_COUNT_TTL_SECS.try_into().unwrap())
+            .await;
+    }
+ 
+    count
+}
+ 
+/// Clean up the miss counter once we've decided to fire callee_offline.
+pub async fn clear_miss_count(redis: &RedisPool, correlation_id: &str) {
+    let key = format!("{}{}", MISS_COUNT_KEY, correlation_id);
+    let mut conn = (**redis).clone();
+    let _: Result<(), _> = conn.del(&key).await;
+}
+ 
+// ── broker heartbeat task ─────────────────────────────────────────────────────
+// Spawn once at startup.  Keeps the heartbeat key alive so other brokers can
+// count us as a peer.
+ 
+pub async fn start_broker_heartbeat(redis: RedisPool, broker_id: String) {
+    tokio::spawn(async move {
+        loop {
+            register_broker(&redis, &broker_id).await;
+            // refresh every 5 s — well within the 15 s TTL
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         }
     });
 }

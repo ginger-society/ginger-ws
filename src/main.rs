@@ -1,4 +1,5 @@
 use crate::mailer::__path_send_email;
+use crate::miss_consumer::start_miss_consumer;
 use crate::rest_bridge::{__path_publish_message, __path_publish_message_userland, __path_publish_message_to_group_api_land, __path_publish_message_to_group};
 use crate::shared::{PendingCall, RabbitPool, RabbitPoolRef, connect_redis_pubsub_pool, publish_to_rabbitmq, start_pending_call_expiry_watcher, start_redis_pubsub_bridge, with_rabbit};
 
@@ -23,7 +24,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use shared::{with_channels, with_connections, with_redis, connect_redis, Channels, Connections, RedisPool};
+use shared::{with_channels, with_connections, with_redis, connect_redis, Channels, Connections, RedisPool, start_broker_heartbeat,};
 
 use utoipa::OpenApi;
 use utoipa_swagger_ui::Config;
@@ -38,6 +39,7 @@ mod requests;
 mod responses;
 mod rest_bridge;
 mod shared;
+mod miss_consumer;
 use crate::mailer::send_email;
 
 // Swagger configuration for the REST endpoints
@@ -76,6 +78,14 @@ async fn main() {
     // RabbitMQ — persistent publish pool
     let rabbit_pool: RabbitPoolRef = Arc::new(RabbitPool::new().await);
 
+    // Using a UUID means each pod/process is uniquely identified in Redis.
+    let broker_id = std::env::var("BROKER_ID")
+        .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+ 
+    println!("[broker] starting as broker_id={}", broker_id);
+
+    start_broker_heartbeat(redis.clone(), broker_id.clone()).await;
+
     // start Redis pub/sub bridge
     // listens on pushkar-redis, delivers to local broadcast::Sender
     start_redis_pubsub_bridge(channels.clone()).await;
@@ -88,6 +98,10 @@ async fn main() {
         consume_messages(channels_mq).await;
     });
 
+    start_miss_consumer(channels.clone(), redis.clone(), rabbit_pool.clone()).await;
+
+
+    let broker_id_ws = broker_id.clone();
     let channels_ws     = channels.clone();
     let connections_ws  = connections.clone();
     let redis_ws        = redis.clone();
@@ -104,19 +118,23 @@ async fn main() {
         .and(with_redis(redis_ws))
         .and(with_redis(redis_pubsub_ws))
         .and(with_rabbit(rabbit_ws))
+        // ── inject broker_id into every WS request ──
+        .and(warp::any().map(move || broker_id_ws.clone()))
         .and_then(
             |channel_name,
-            ws,
-            query_params: HashMap<String, String>,
-            channels,
-            connections,
-            redis,
-            redis_pubsub,
-            rabbit_pool| {
+             ws,
+             query_params: HashMap<String, String>,
+             channels,
+             connections,
+             redis,
+             redis_pubsub,
+             rabbit_pool,
+             broker_id: String| {           // NEW param
                 let token = query_params.get("token").cloned();
                 user_authenticated(
                     channel_name, ws, channels, connections,
                     redis, redis_pubsub, rabbit_pool, token,
+                    broker_id,              // NEW arg
                 )
             },
         )

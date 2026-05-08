@@ -458,6 +458,27 @@ pub async fn start_pending_call_expiry_watcher(
                 if let Some(shadow_str) = shadow {
                     if let Ok(shadow_val) = serde_json::from_str::<serde_json::Value>(&shadow_str) {
                         if let Some(caller_channel) = shadow_val["caller_channel"].as_str() {
+                            
+                            // only one broker should fire the timeout
+                            let lock_key = format!("timeout_fired:{}", correlation_id);
+                            let acquired: bool = redis::cmd("SET")
+                                .arg(&lock_key)
+                                .arg("1")
+                                .arg("NX")
+                                .arg("EX")
+                                .arg(10u64)
+                                .query_async(&mut conn)
+                                .await
+                                .unwrap_or(false);
+
+                            if !acquired {
+                                println!(
+                                    "[redis-expiry] timeout already fired by another broker corr={} — skipping",
+                                    correlation_id
+                                );
+                                continue;
+                            }
+
                             let timeout = serde_json::json!({
                                 "message_type": 0,
                                 "error": "callee_timeout",

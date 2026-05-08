@@ -23,10 +23,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use shared::{
-    with_channels, with_connections, with_pending_calls,
-    Channels, Connections, PendingCalls,
-};
+use shared::{with_channels, with_connections, with_redis, connect_redis, Channels, Connections, RedisPool};
 
 use utoipa::OpenApi;
 use utoipa_swagger_ui::Config;
@@ -69,7 +66,6 @@ async fn main() {
 
     let channels: Channels = Arc::new(Mutex::new(HashMap::new()));
     let connections: Connections = Arc::new(Mutex::new(HashMap::new()));
-    let pending_calls: PendingCalls = Arc::new(Mutex::new(HashMap::new()));
 
     // Start RabbitMQ consumer
     let channels_clone = channels.clone();
@@ -78,42 +74,8 @@ async fn main() {
         // Ensure the block returns `()`
     });
 
-    // TTL cleanup for stale pending calls
-    let pending_calls_ttl = pending_calls.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+    let redis: RedisPool = connect_redis().await;
 
-            let expired: Vec<PendingCall> = {
-                let pending = pending_calls_ttl.lock().await;
-                pending
-                    .values()
-                    .filter(|pc| pc.created_at.elapsed().as_secs() >= 300)
-                    .cloned()
-                    .collect()
-            };
-
-            if !expired.is_empty() {
-                let mut pending = pending_calls_ttl.lock().await;
-                for pc in &expired {
-                    let error = serde_json::json!({
-                        "message_type": 0,
-                        "error": "call_expired",
-                        "correlation_id": pc.correlation_id,
-                    });
-                    publish_to_rabbitmq(
-                        &pc.reply_to,
-                        &error.to_string(),
-                    ).await;
-                    println!(
-                        "[ttl] call expired — notified caller on '{}' corr={}",
-                        pc.reply_to, pc.correlation_id
-                    );
-                    pending.remove(&pc.correlation_id);
-                }
-            }
-        }
-    });
 
     // WebSocket endpoint to subscribe to channels
     let channels_ws = channels.clone();
@@ -121,7 +83,8 @@ async fn main() {
 
     let channels_ws = channels.clone();
     let connections_ws = connections.clone();
-    let pending_calls_ws = pending_calls.clone();
+    let redis_ws = redis.clone();
+
 
     let websocket_route = warp::path("notification")
     .and(warp::path("ws"))
@@ -130,7 +93,7 @@ async fn main() {
     .and(warp::query::<HashMap<String, String>>())
     .and(with_channels(channels_ws))
     .and(with_connections(connections_ws))
-    .and(with_pending_calls(pending_calls_ws))
+    .and(with_redis(redis_ws))
     .and_then(
         |channel_name, ws, query_params: HashMap<String, String>, channels, connections, pending_calls| {
             let token = query_params.get("token").cloned();

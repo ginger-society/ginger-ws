@@ -2,8 +2,9 @@ use crate::{
     requests::{WampCalleeDisconnected, WampCalleeOffline, WampEvent, WampPublish},
     responses::{InvalidTokenError, JWTError},
     shared::{
-        publish_to_rabbitmq, Channel, Channels, Connections, PendingCall, PendingCalls,
-        WsConnection,
+        pending_call_insert, pending_call_remove, pending_calls_for_channel,
+        publish_to_rabbitmq, Channel, Channels, Connections, PendingCall,
+        RedisPool, WsConnection,
     },
 };
 use futures::{sink::SinkExt, StreamExt};
@@ -18,12 +19,11 @@ pub async fn user_connected(
     channel_name: String,
     channels: Channels,
     connections: Connections,
-    pending_calls: PendingCalls,
+    redis: RedisPool,
 ) {
     let (mut ws_tx, mut ws_rx) = ws.split();
     let connection_id = Uuid::new_v4();
 
-    // ── register this connection ──────────────────────────────────────────────
     let (conn_tx, _) = broadcast::channel::<String>(32);
     {
         let mut conns = connections.lock().await;
@@ -38,7 +38,6 @@ pub async fn user_connected(
         connection_id, channel_name
     );
 
-    // ── join or create the named channel ──────────────────────────────────────
     let (channel_tx, mut channel_rx) = {
         let mut channels_lock = channels.lock().await;
         let channel = channels_lock
@@ -50,11 +49,10 @@ pub async fn user_connected(
         (channel.tx.clone(), channel.tx.subscribe())
     };
 
-    // ── inbound: client → broker ──────────────────────────────────────────────
-    let channels_inbound      = channels.clone();
-    let pending_calls_inbound = pending_calls.clone();
-    let connections_inbound   = connections.clone();
-    let channel_name_inbound  = channel_name.clone();
+    let channels_inbound     = channels.clone();
+    let connections_inbound  = connections.clone();
+    let redis_inbound        = redis.clone();
+    let channel_name_inbound = channel_name.clone();
 
     tokio::spawn(async move {
         while let Some(result) = ws_rx.next().await {
@@ -65,8 +63,7 @@ pub async fn user_connected(
                         let publication_id = rand::random::<u64>();
                         let target_channel = publish.topic.clone();
 
-                        // ── check if this is a result coming back from callee ─
-                        // if kwargs contains is_result: true, resolve the pending call
+                        // ── resolve pending call if this is a result ──────────
                         let is_result = publish.kwargs
                             .as_ref()
                             .and_then(|kw| kw.get("is_result"))
@@ -75,12 +72,8 @@ pub async fn user_connected(
 
                         if is_result {
                             if let Some(corr_id) = &publish.options.correlation_id {
-                                let mut pending = pending_calls_inbound.lock().await;
-                                if pending.remove(corr_id).is_some() {
-                                    println!(
-                                        "[ws] pending call resolved corr={}",
-                                        corr_id
-                                    );
+                                if pending_call_remove(&redis_inbound, corr_id).await.is_some() {
+                                    println!("[ws] pending call resolved corr={}", corr_id);
                                 }
                             }
                         }
@@ -95,7 +88,6 @@ pub async fn user_connected(
                         };
 
                         if receiver_count == 0 {
-                            // callee offline — notify caller via RabbitMQ
                             if let Some(reply_to) = &publish.options.reply_to {
                                 let offline = WampCalleeOffline {
                                     message_type: 0,
@@ -106,8 +98,7 @@ pub async fn user_connected(
                                 publish_to_rabbitmq(
                                     reply_to,
                                     &serde_json::to_string(&offline).unwrap(),
-                                )
-                                .await;
+                                ).await;
                                 println!(
                                     "[ws] callee_offline on '{}' — notified caller on '{}'",
                                     target_channel, reply_to
@@ -120,7 +111,6 @@ pub async fn user_connected(
                             }
 
                         } else {
-                            // callee online — deliver via RabbitMQ
                             let event = WampEvent::from_publish(&publish, publication_id);
                             let event_str = serde_json::to_string(&event).unwrap();
                             publish_to_rabbitmq(&target_channel, &event_str).await;
@@ -136,79 +126,53 @@ pub async fn user_connected(
                                     publish.options.correlation_id.clone(),
                                     publish.options.reply_to.clone(),
                                 ) {
-                                    let mut pending = pending_calls_inbound.lock().await;
-                                    pending.insert(
-                                        corr_id.clone(),
-                                        PendingCall {
-                                            correlation_id: corr_id.clone(),
-                                            reply_to,
-                                            callee_channel: target_channel.clone(),
-                                            caller_connection_id: connection_id,
-                                            created_at: std::time::Instant::now(),
-                                        },
-                                    );
-                                    println!(
-                                        "[ws] pending call tracked corr={}",
-                                        corr_id
-                                    );
+                                    let pc = PendingCall {
+                                        correlation_id: corr_id.clone(),
+                                        reply_to,
+                                        callee_channel: target_channel.clone(),
+                                        caller_connection_id: connection_id.to_string(),
+                                    };
+                                    pending_call_insert(&redis_inbound, &pc).await;
                                 }
                             }
                         }
 
                     } else {
-                        // legacy raw string — broadcast to connected channel as-is
                         let _ = channel_tx.send(text.to_string());
                     }
                 }
             }
         }
 
-        // ── client disconnected ───────────────────────────────────────────────
+        // ── disconnect cleanup ────────────────────────────────────────────────
         println!(
             "[ws] connection {} disconnected — running cleanup",
             connection_id
         );
 
-        // Step 1: collect orphaned calls where this connection was the callee
-        let orphaned: Vec<PendingCall> = {
-            let pending = pending_calls_inbound.lock().await;
-            pending
-                .values()
-                .filter(|pc| {
-                    pc.callee_channel == channel_name_inbound
-                        && pc.caller_connection_id != connection_id
-                })
-                .cloned()
-                .collect()
-        };
+        let orphaned = pending_calls_for_channel(
+            &redis_inbound,
+            &channel_name_inbound,
+            &connection_id.to_string(),
+        ).await;
 
-        // Step 2: notify callers via RabbitMQ and remove orphaned calls
-        if !orphaned.is_empty() {
-            let mut pending = pending_calls_inbound.lock().await;
-
-            for pc in &orphaned {
-                let error = WampCalleeDisconnected {
-                    message_type: 0,
-                    error: "callee_disconnected".to_string(),
-                    correlation_id: Some(pc.correlation_id.clone()),
-                };
-
-                publish_to_rabbitmq(
-                    &pc.reply_to,
-                    &serde_json::to_string(&error).unwrap(),
-                )
-                .await;
-
-                println!(
-                    "[ws] callee_disconnected — notified caller on '{}' corr={}",
-                    pc.reply_to, pc.correlation_id
-                );
-
-                pending.remove(&pc.correlation_id);
-            }
+        for pc in &orphaned {
+            let error = WampCalleeDisconnected {
+                message_type: 0,
+                error: "callee_disconnected".to_string(),
+                correlation_id: Some(pc.correlation_id.clone()),
+            };
+            publish_to_rabbitmq(
+                &pc.reply_to,
+                &serde_json::to_string(&error).unwrap(),
+            ).await;
+            pending_call_remove(&redis_inbound, &pc.correlation_id).await;
+            println!(
+                "[ws] callee_disconnected — notified caller on '{}' corr={}",
+                pc.reply_to, pc.correlation_id
+            );
         }
 
-        // Step 3: remove from connection registry
         {
             let mut conns = connections_inbound.lock().await;
             conns.remove(&connection_id);
@@ -217,7 +181,6 @@ pub async fn user_connected(
         println!("[ws] connection {} fully cleaned up", connection_id);
     });
 
-    // ── outbound: broker → this client ───────────────────────────────────────
     tokio::spawn(async move {
         while let Ok(message) = channel_rx.recv().await {
             if ws_tx.send(Message::text(message)).await.is_err() {
@@ -228,16 +191,16 @@ pub async fn user_connected(
 }
 
 pub async fn handle_ws_upgrade(
-    (ws, channel_name, channels, connections, pending_calls): (
+    (ws, channel_name, channels, connections, redis): (
         warp::ws::Ws,
         String,
         Channels,
         Connections,
-        PendingCalls,
+        RedisPool,
     ),
 ) -> Result<impl warp::Reply, Rejection> {
     Ok(ws.on_upgrade(move |socket| {
-        user_connected(socket, channel_name, channels, connections, pending_calls)
+        user_connected(socket, channel_name, channels, connections, redis)
     }))
 }
 
@@ -246,9 +209,9 @@ pub async fn user_authenticated(
     ws: warp::ws::Ws,
     channels: Channels,
     connections: Connections,
-    pending_calls: PendingCalls,
+    redis: RedisPool,
     token: Option<String>,
-) -> Result<(warp::ws::Ws, String, Channels, Connections, PendingCalls), Rejection> {
+) -> Result<(warp::ws::Ws, String, Channels, Connections, RedisPool), Rejection> {
     if let Some(token) = token {
         let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "1234".to_string());
         let decoding_key = DecodingKey::from_secret(secret.as_ref());
@@ -256,12 +219,12 @@ pub async fn user_authenticated(
 
         if let Ok(token_data) = decode::<Claims>(&token, &decoding_key, &validation) {
             println!("Authenticated user: {:?}", token_data.claims.user_id);
-            return Ok((ws, channel_name, channels, connections, pending_calls));
+            return Ok((ws, channel_name, channels, connections, redis));
         }
 
         if let Ok(token_data) = decode::<APIClaims>(&token, &decoding_key, &validation) {
             println!("Authenticated API user: {:?}", token_data.claims.sub);
-            return Ok((ws, channel_name, channels, connections, pending_calls));
+            return Ok((ws, channel_name, channels, connections, redis));
         }
 
         println!("Unauthorized access attempt");
@@ -271,6 +234,7 @@ pub async fn user_authenticated(
         Err(warp::reject::custom(JWTError))
     }
 }
+
 
 pub async fn authenticate_token(token: Option<String>) -> Result<Claims, warp::Rejection> {
     if let Some(token) = token {

@@ -23,6 +23,8 @@ warp = "0.3"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 rand = "0.8"
+redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
+
 
 [package.metadata]
 organization = "ginger-society"

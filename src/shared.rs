@@ -42,7 +42,7 @@ pub type RedisPool   = Arc<redis::aio::ConnectionManager>;
 
 pub const PENDING_CALL_TTL_SECS: u64 = 20;
 const PENDING_KEY: &str = "pending_call:";
-
+const PENDING_INDEX_KEY: &str = "pending_call_index:";
 // ── warp filters ──────────────────────────────────────────────────────────────
 
 pub fn with_channels(
@@ -307,18 +307,33 @@ pub async fn pending_call_insert(redis: &RedisPool, pc: &PendingCall) {
     let value = serde_json::to_string(pc).unwrap();
     let mut conn = (**redis).clone();
 
+    // main pending call key
     let _: Result<(), _> = conn
         .set_ex(&key, value, PENDING_CALL_TTL_SECS.try_into().unwrap())
         .await;
 
-    // shadow key outlives main key by 5s so watcher can still read it
+    // secondary index — Set of correlation_ids per callee channel
+    let index_key = format!("{}{}", PENDING_INDEX_KEY, pc.callee_channel);
+    let _: Result<(), _> = conn
+        .sadd(&index_key, &pc.correlation_id)
+        .await;
+    // expire the index key in line with the TTL — refreshed on each insert
+    let _: Result<(), _> = conn
+        .expire(&index_key, PENDING_CALL_TTL_SECS.try_into().unwrap())
+        .await;
+
+    // shadow key for expiry watcher
     let shadow_key = format!("pending_call_caller:{}", pc.correlation_id);
     let shadow_value = serde_json::json!({
         "caller_channel": pc.caller_channel,
         "correlation_id": pc.correlation_id,
     }).to_string();
     let _: Result<(), _> = conn
-        .set_ex(&shadow_key, shadow_value, (PENDING_CALL_TTL_SECS + 5).try_into().unwrap())
+        .set_ex(
+            &shadow_key,
+            shadow_value,
+            (PENDING_CALL_TTL_SECS + 5).try_into().unwrap(),
+        )
         .await;
 
     println!("[redis] pending call inserted corr={}", pc.correlation_id);
@@ -327,8 +342,17 @@ pub async fn pending_call_insert(redis: &RedisPool, pc: &PendingCall) {
 pub async fn pending_call_remove(redis: &RedisPool, correlation_id: &str) -> Option<PendingCall> {
     let key = format!("{}{}", PENDING_KEY, correlation_id);
     let mut conn = (**redis).clone();
+
     let value: Option<String> = conn.get_del(&key).await.ok().flatten();
-    value.and_then(|v| serde_json::from_str(&v).ok())
+    let pc = value.and_then(|v| serde_json::from_str::<PendingCall>(&v).ok());
+
+    // remove from secondary index
+    if let Some(ref pc) = pc {
+        let index_key = format!("{}{}", PENDING_INDEX_KEY, pc.callee_channel);
+        let _: Result<(), _> = conn.srem(&index_key, &pc.correlation_id).await;
+    }
+
+    pc
 }
 
 pub async fn pending_calls_for_channel(
@@ -337,29 +361,34 @@ pub async fn pending_calls_for_channel(
     exclude_caller_id: &str,
 ) -> Vec<PendingCall> {
     let mut conn = (**redis).clone();
-    let pattern = format!("{}*", PENDING_KEY);
 
-    let keys: Vec<String> = match conn.keys(&pattern).await {
-        Ok(k) => k,
+    // read the index — O(1) instead of KEYS *
+    let index_key = format!("{}{}", PENDING_INDEX_KEY, callee_channel);
+    let correlation_ids: Vec<String> = match conn.smembers(&index_key).await {
+        Ok(ids) => ids,
         Err(e) => {
-            eprintln!("[redis] KEYS scan failed: {:?}", e);
+            eprintln!("[redis] index read failed: {:?}", e);
             return vec![];
         }
     };
 
     let mut results = vec![];
-    for key in keys {
+    for corr_id in correlation_ids {
+        let key = format!("{}{}", PENDING_KEY, corr_id);
         let value: Option<String> = conn.get(&key).await.ok().flatten();
+
         if let Some(v) = value {
             if let Ok(pc) = serde_json::from_str::<PendingCall>(&v) {
-                if pc.callee_channel == callee_channel
-                    && pc.caller_connection_id != exclude_caller_id
-                {
+                if pc.caller_connection_id != exclude_caller_id {
                     results.push(pc);
                 }
             }
+        } else {
+            // main key expired but index not cleaned up yet — remove stale entry
+            let _: Result<(), _> = conn.srem(&index_key, &corr_id).await;
         }
     }
+
     results
 }
 

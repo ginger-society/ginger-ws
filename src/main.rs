@@ -1,6 +1,6 @@
 use crate::mailer::__path_send_email;
 use crate::rest_bridge::{__path_publish_message, __path_publish_message_userland, __path_publish_message_to_group_api_land, __path_publish_message_to_group};
-use crate::shared::{PendingCall, RabbitPool, RabbitPoolRef, connect_redis_pubsub_pool, publish_to_rabbitmq, start_redis_pubsub_bridge, with_rabbit};
+use crate::shared::{PendingCall, RabbitPool, RabbitPoolRef, connect_redis_pubsub_pool, publish_to_rabbitmq, start_pending_call_expiry_watcher, start_redis_pubsub_bridge, with_rabbit};
 
 use auth_helpers::{
     handle_ws_upgrade, user_authenticated, with_api_auth, with_auth,
@@ -79,7 +79,8 @@ async fn main() {
     // start Redis pub/sub bridge
     // listens on pushkar-redis, delivers to local broadcast::Sender
     start_redis_pubsub_bridge(channels.clone()).await;
-
+    start_pending_call_expiry_watcher(rabbit_pool.clone(), redis.clone()).await;
+    
     // start RabbitMQ consumer
     // exclusive queue per instance, fanout delivers to all instances
     let channels_mq = channels.clone();

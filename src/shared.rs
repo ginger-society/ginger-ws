@@ -33,6 +33,7 @@ pub struct PendingCall {
     pub reply_to: String,
     pub callee_channel: String,
     pub caller_connection_id: String,
+    pub caller_channel: String,
 }
 
 pub type Channels    = Arc<Mutex<HashMap<String, Channel>>>;
@@ -201,7 +202,6 @@ pub async fn publish_to_rabbitmq(pool: &RabbitPoolRef, channel_id: &str, message
 }
 
 // ── Redis connections ─────────────────────────────────────────────────────────
-
 pub async fn connect_redis() -> RedisPool {
     let url = std::env::var("REDIS_URI")
         .unwrap_or_else(|_| "redis://localhost:6380".to_string());
@@ -209,6 +209,16 @@ pub async fn connect_redis() -> RedisPool {
     let manager = redis::aio::ConnectionManager::new(client)
         .await
         .expect("Failed to connect to Redis");
+    
+    // enable keyspace notifications for expired events
+    let mut conn = manager.clone();
+    let _: Result<(), _> = redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("notify-keyspace-events")
+        .arg("Ex")  // E = keyspace events, x = expired events
+        .query_async(&mut conn)
+        .await;
+    
     Arc::new(manager)
 }
 
@@ -292,14 +302,25 @@ pub async fn start_redis_pubsub_bridge(channels: Channels) {
 }
 
 // ── Redis pending call helpers ────────────────────────────────────────────────
-
 pub async fn pending_call_insert(redis: &RedisPool, pc: &PendingCall) {
     let key = format!("{}{}", PENDING_KEY, pc.correlation_id);
     let value = serde_json::to_string(pc).unwrap();
     let mut conn = (**redis).clone();
+
     let _: Result<(), _> = conn
         .set_ex(&key, value, PENDING_CALL_TTL_SECS.try_into().unwrap())
         .await;
+
+    // shadow key outlives main key by 5s so watcher can still read it
+    let shadow_key = format!("pending_call_caller:{}", pc.correlation_id);
+    let shadow_value = serde_json::json!({
+        "caller_channel": pc.caller_channel,
+        "correlation_id": pc.correlation_id,
+    }).to_string();
+    let _: Result<(), _> = conn
+        .set_ex(&shadow_key, shadow_value, (PENDING_CALL_TTL_SECS + 5).try_into().unwrap())
+        .await;
+
     println!("[redis] pending call inserted corr={}", pc.correlation_id);
 }
 
@@ -342,40 +363,98 @@ pub async fn pending_calls_for_channel(
     results
 }
 
+pub async fn start_pending_call_expiry_watcher(
+    rabbit_pool: RabbitPoolRef,
+    redis_pool: RedisPool,
+) {
+    let url = std::env::var("REDIS_URI")
+        .unwrap_or_else(|_| "redis://localhost:6380".to_string());
 
-pub async fn connect_rabbitmq() -> Result<RabbitChannel, lapin::Error> {
-    let addr = std::env::var("AMPQ_URI")
-        .unwrap_or_else(|_| "amqp://user:password@localhost:5672/%2f".to_string());
+    tokio::spawn(async move {
+        loop {
+            let client = match redis::Client::open(url.clone()) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[redis-expiry] client error: {:?} — retrying in 2s", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
 
-    let conn = LapinConnection::connect(&addr, ConnectionProperties::default()).await?;
-    let channel = conn.create_channel().await?;
+            let mut pubsub = match client.get_async_pubsub().await {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[redis-expiry] connect failed: {:?} — retrying in 2s", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
 
-    channel
-        .exchange_declare(
-            "real-time-updates",
-            lapin::ExchangeKind::Fanout,
-            Default::default(),
-            Default::default(),
-        )
-        .await?;
+            if let Err(e) = pubsub.psubscribe("__keyevent@0__:expired").await {
+                eprintln!("[redis-expiry] psubscribe failed: {:?} — retrying in 2s", e);
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                continue;
+            }
 
-    channel
-        .queue_declare(
-            "real-time-updates-queue",
-            Default::default(),
-            Default::default(),
-        )
-        .await?;
+            println!("[redis-expiry] watcher active");
 
-    channel
-        .queue_bind(
-            "real-time-updates-queue",
-            "real-time-updates",
-            "",
-            Default::default(),
-            Default::default(),
-        )
-        .await?;
+            let mut stream = pubsub.into_on_message();
 
-    Ok(channel)
+            while let Some(msg) = stream.next().await {
+                let expired_key: String = match msg.get_payload() {
+                    Ok(k) => k,
+                    Err(_) => continue,
+                };
+
+                if !expired_key.starts_with(PENDING_KEY) {
+                    continue;
+                }
+
+                let correlation_id = expired_key
+                    .trim_start_matches(PENDING_KEY)
+                    .to_string();
+
+                println!("[redis-expiry] pending call expired corr={}", correlation_id);
+
+                // read shadow key — still alive for 5 more seconds
+                let shadow_key = format!("pending_call_caller:{}", correlation_id);
+                let mut conn = (*redis_pool).clone();
+                let shadow: Option<String> = conn.get(&shadow_key).await.unwrap_or(None);
+
+                if let Some(shadow_str) = shadow {
+                    if let Ok(shadow_val) = serde_json::from_str::<serde_json::Value>(&shadow_str) {
+                        if let Some(caller_channel) = shadow_val["caller_channel"].as_str() {
+                            let timeout = serde_json::json!({
+                                "message_type": 0,
+                                "error": "callee_timeout",
+                                "correlation_id": correlation_id,
+                            });
+
+                            publish_to_rabbitmq(
+                                &rabbit_pool,
+                                caller_channel,
+                                &timeout.to_string(),
+                            ).await;
+
+                            println!(
+                                "[redis-expiry] callee_timeout sent to '{}' corr={}",
+                                caller_channel, correlation_id
+                            );
+
+                            // clean up shadow key
+                            let _: Result<(), _> = conn.del(&shadow_key).await;
+                        }
+                    }
+                } else {
+                    println!(
+                        "[redis-expiry] shadow key not found for corr={} — caller may have already been notified",
+                        correlation_id
+                    );
+                }
+            }
+
+            eprintln!("[redis-expiry] stream ended — reconnecting in 2s...");
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        }
+    });
 }

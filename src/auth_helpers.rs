@@ -132,6 +132,7 @@ pub async fn user_connected(
                                         reply_to,
                                         callee_channel: target_channel.clone(),
                                         caller_connection_id: connection_id.to_string(),
+                                        caller_channel: channel_name_inbound.clone(),
                                     };
                                     pending_call_insert(&redis_inbound, &pc).await;
                                 }

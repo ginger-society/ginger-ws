@@ -94,21 +94,35 @@ pub async fn user_connected(
                             // callee_offline immediately.  The miss consumer will
                             // aggregate across all broker instances and only fire
                             // the error when every broker reports a miss.
-                            let miss = CalleeMissNotice {
-                                correlation_id: publish.options.correlation_id.clone(),
-                                topic: target_channel.clone(),
-                                reply_to: publish.options.reply_to
-                                    .clone()
-                                    .or_else(|| Some(channel_name_inbound.clone())),
-                                broker_id: broker_id_inbound.clone(),
-                            };
- 
-                            publish_callee_miss(&rabbit_pool, &miss).await;
- 
-                            println!(
-                                "[ws] no local subs on '{}' — miss notice published (broker={})",
-                                target_channel, broker_id_inbound
-                            );
+
+                            let is_rpc_call = publish.kwargs
+                                .as_ref()
+                                .and_then(|kw| kw.get("function"))
+                                .is_some();
+
+
+                            if is_rpc_call {
+                                let miss = CalleeMissNotice {
+                                    correlation_id: publish.options.correlation_id.clone(),
+                                    topic: target_channel.clone(),
+                                    reply_to: publish.options.reply_to
+                                        .clone()
+                                        .or_else(|| Some(channel_name_inbound.clone())),
+                                    broker_id: broker_id_inbound.clone(),
+                                };
+    
+                                publish_callee_miss(&rabbit_pool, &miss).await;
+    
+                                println!(
+                                    "[ws] no local subs on '{}' — miss notice published (broker={})",
+                                    target_channel, broker_id_inbound
+                                )
+                            } else{
+                                println!(
+                                    "[ws] no local subs on '{}' — plain publish, silently dropped",
+                                    target_channel
+                                );
+                            }
                         } else {
                             let event = WampEvent::from_publish(&publish, publication_id);
                             let event_str = serde_json::to_string(&event).unwrap();
@@ -121,19 +135,30 @@ pub async fn user_connected(
  
                             // track as pending call if RPC-style and not a result
                             if !is_result {
-                                if let (Some(corr_id), Some(reply_to)) = (
-                                    publish.options.correlation_id.clone(),
-                                    publish.options.reply_to.clone(),
-                                ) {
-                                    let pc = PendingCall {
-                                        correlation_id: corr_id.clone(),
-                                        reply_to,
-                                        callee_channel: target_channel.clone(),
-                                        caller_connection_id: connection_id.to_string(),
-                                        caller_channel: channel_name_inbound.clone(),
-                                    };
-                                    pending_call_insert(&redis_inbound, &pc).await;
+                                let is_rpc_call = publish.kwargs
+                                    .as_ref()
+                                    .and_then(|kw| kw.get("function"))
+                                    .is_some();
+
+
+                                if is_rpc_call {
+
+                                    if let (Some(corr_id), Some(reply_to)) = (
+                                        publish.options.correlation_id.clone(),
+                                        publish.options.reply_to.clone(),
+                                    ) {
+                                        let pc = PendingCall {
+                                            correlation_id: corr_id.clone(),
+                                            reply_to,
+                                            callee_channel: target_channel.clone(),
+                                            caller_connection_id: connection_id.to_string(),
+                                            caller_channel: channel_name_inbound.clone(),
+                                        };
+                                        pending_call_insert(&redis_inbound, &pc).await;
+                                    }
+
                                 }
+                                
                             }
                         }
  

@@ -39,7 +39,7 @@ pub type Channels    = Arc<Mutex<HashMap<String, Channel>>>;
 pub type Connections = Arc<Mutex<HashMap<Uuid, WsConnection>>>;
 pub type RedisPool   = Arc<redis::aio::ConnectionManager>;
 
-pub const PENDING_CALL_TTL_SECS: u64 = 300;
+pub const PENDING_CALL_TTL_SECS: u64 = 20;
 const PENDING_KEY: &str = "pending_call:";
 
 // ── warp filters ──────────────────────────────────────────────────────────────

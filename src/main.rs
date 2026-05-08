@@ -122,46 +122,55 @@ async fn main() {
         .and_then(handle_ws_upgrade);
 
 
+    // ── publish via ISC ───────────────────────────────────────────────────────
     let channels_rest = channels.clone();
-    let publish_route = warp::path("notification")
-        .and(warp::path!("user-land" / "channels" / String / "publish"))
-        .and(warp::post())
-        .and(warp::body::json())
-        .and(with_auth()) // Add authentication here
-        .and(with_get_auth_header())
-        .and(with_channels(channels_rest))
-        .and_then(publish_message_userland);
-    
-
-    let channels_rest = channels.clone();
+    let rabbit_rest = rabbit_pool.clone();
     let publish_via_isc_route = warp::path("notification")
         .and(warp::path!("channels" / String / "publish"))
         .and(warp::post())
         .and(warp::body::json())
-        .and(with_isc_api_auth()) // Add authentication here
+        .and(with_isc_api_auth())
         .and(with_channels(channels_rest))
+        .and(with_rabbit(rabbit_rest))
         .and_then(publish_message);
-    
-    
 
+    // ── user-land publish ─────────────────────────────────────────────────────
     let channels_rest = channels.clone();
+    let rabbit_rest = rabbit_pool.clone();
+    let publish_route = warp::path("notification")
+        .and(warp::path!("user-land" / "channels" / String / "publish"))
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(with_auth())
+        .and(with_get_auth_header())
+        .and(with_channels(channels_rest))
+        .and(with_rabbit(rabbit_rest))
+        .and_then(publish_message_userland);
+
+    // ── group publish ISC ─────────────────────────────────────────────────────
+    let channels_rest = channels.clone();
+    let rabbit_rest = rabbit_pool.clone();
     let group_publish_route_isc = warp::path("notification")
         .and(warp::path!("groups" / String / "publish"))
         .and(warp::post())
         .and(warp::body::json())
-        .and(with_isc_api_auth()) // Add authentication here
+        .and(with_isc_api_auth())
         .and(with_get_isc_auth_header())
         .and(with_channels(channels_rest))
+        .and(with_rabbit(rabbit_rest))
         .and_then(publish_message_to_group);
 
+    // ── group publish API land ────────────────────────────────────────────────
     let channels_rest = channels.clone();
+    let rabbit_rest = rabbit_pool.clone();
     let group_publish_route = warp::path("notification")
-        .and(warp::path!("api-land" /"groups" / String / "publish"))
+        .and(warp::path!("api-land" / "groups" / String / "publish"))
         .and(warp::post())
         .and(warp::body::json())
-        .and(with_api_auth()) // Add authentication here
+        .and(with_api_auth())
         .and(with_get_api_auth_header())
         .and(with_channels(channels_rest))
+        .and(with_rabbit(rabbit_rest))
         .and_then(publish_message_to_group_api_land);
 
     let send_email_route = warp::path("notification")

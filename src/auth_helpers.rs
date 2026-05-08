@@ -53,6 +53,7 @@ pub async fn user_connected(
     let connections_inbound  = connections.clone();
     let redis_inbound        = redis.clone();
     let channel_name_inbound = channel_name.clone();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     tokio::spawn(async move {
         while let Some(result) = ws_rx.next().await {
@@ -88,29 +89,28 @@ pub async fn user_connected(
                         };
 
                         if receiver_count == 0 {
-                            if let Some(reply_to) = &publish.options.reply_to {
-                                let offline = WampCalleeOffline {
-                                    message_type: 0,
-                                    error: "callee_offline".to_string(),
-                                    correlation_id: publish.options.correlation_id.clone(),
-                                    topic: target_channel.clone(),
-                                };
-                                publish_to_rabbitmq(
-                                    &rabbit_pool, 
-                                    reply_to,
-                                    &serde_json::to_string(&offline).unwrap(),
-                                ).await;
-                                println!(
-                                    "[ws] callee_offline on '{}' — notified caller on '{}'",
-                                    target_channel, reply_to
-                                );
-                            } else {
-                                println!(
-                                    "[ws] PUBLISH to offline channel '{}' — no reply_to set",
-                                    target_channel
-                                );
-                            }
+                            let offline = WampCalleeOffline {
+                                message_type: 0,
+                                error: "callee_offline".to_string(),
+                                correlation_id: publish.options.correlation_id.clone(),
+                                topic: target_channel.clone(),
+                            };
 
+                            let notify_channel = publish.options.reply_to
+                                .as_deref()
+                                .unwrap_or(&channel_name_inbound)
+                                .to_string();
+
+                            publish_to_rabbitmq(
+                                &rabbit_pool,
+                                &notify_channel,
+                                &serde_json::to_string(&offline).unwrap(),
+                            ).await;
+
+                            println!(
+                                "[ws] callee_offline on '{}' — notified publisher on '{}'",
+                                target_channel, notify_channel
+                            );
                         } else {
                             let event = WampEvent::from_publish(&publish, publication_id);
                             let event_str = serde_json::to_string(&event).unwrap();
@@ -179,15 +179,20 @@ pub async fn user_connected(
             let mut conns = connections_inbound.lock().await;
             conns.remove(&connection_id);
         }
-
+        let _ = shutdown_tx.send(());
         println!("[ws] connection {} fully cleaned up", connection_id);
     });
 
     tokio::spawn(async move {
-        while let Ok(message) = channel_rx.recv().await {
-            if ws_tx.send(Message::text(message)).await.is_err() {
-                break;
-            }
+        tokio::select! {
+            _ = async {
+                while let Ok(message) = channel_rx.recv().await {
+                    if ws_tx.send(Message::text(message)).await.is_err() {
+                        break;
+                    }
+                }
+            } => {}
+            _ = shutdown_rx => {}  // inbound task done → drop channel_rx immediately
         }
     });
 }

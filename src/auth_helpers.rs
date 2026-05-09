@@ -46,6 +46,12 @@ pub async fn user_connected(
                 let (tx, _) = broadcast::channel(100);
                 Channel { name: channel_name.clone(), tx }
             });
+        println!(
+            "[ws] channel '{}' sender_id={:p} receiver_count={}",
+            channel_name,
+            &channel.tx,
+            channel.tx.receiver_count()
+        );
         (channel.tx.clone(), channel.tx.subscribe())
     };
  

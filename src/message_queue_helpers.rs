@@ -59,6 +59,12 @@ pub async fn process_rabbitmq_messages(
                             channel.tx.receiver_count(),
                             rabbit_message.message
                         );
+                        println!(
+                            "[rabbitmq] found channel '{}' sender_id={:p} receiver_count={}",
+                            rabbit_message.channel_id,
+                            &channel.tx,
+                            channel.tx.receiver_count()
+                        );
                         if channel.tx.receiver_count() > 0 {
                             let _ = channel.tx.send(rabbit_message.message.clone());
                         }

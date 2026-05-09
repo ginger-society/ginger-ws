@@ -157,7 +157,7 @@ pub async fn connect_rabbitmq_consumer(broker_id: String) -> Result<(RabbitChann
 
     let queue = channel
         .queue_declare(
-            &queue_name,   // ← stable name, survives reconnect
+            "",   // ← stable name, survives reconnect
             QueueDeclareOptions {
                 durable: true,       // survives RabbitMQ restart
                 auto_delete: false,  // not deleted on disconnect

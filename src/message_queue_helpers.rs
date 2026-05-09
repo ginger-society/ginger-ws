@@ -54,6 +54,11 @@ pub async fn process_rabbitmq_messages(
                 if let Ok(rabbit_message) = serde_json::from_str::<RabbitMessage>(&message) {
                     let channels_lock = channels.lock().await;
                     if let Some(channel) = channels_lock.get(&rabbit_message.channel_id) {
+                        println!("[rabbitmq] delivering to '{}' receiver_count={} msg={}", 
+                            rabbit_message.channel_id, 
+                            channel.tx.receiver_count(),
+                            rabbit_message.message
+                        );
                         if channel.tx.receiver_count() > 0 {
                             let _ = channel.tx.send(rabbit_message.message.clone());
                         }

@@ -152,12 +152,18 @@ pub async fn connect_rabbitmq_consumer() -> Result<(RabbitChannel, String), lapi
     // exclusive auto-named queue — unique per broker instance
     // auto_delete: true  → deleted when this connection closes
     // exclusive: true    → only this connection can consume from it
+    let broker_id = std::env::var("BROKER_ID")
+        .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+
+    let queue_name = format!("broker_{}", broker_id);
+
     let queue = channel
         .queue_declare(
-            "",
+            &queue_name,   // ← stable name, survives reconnect
             QueueDeclareOptions {
-                exclusive: true,
-                auto_delete: true,
+                durable: true,       // survives RabbitMQ restart
+                auto_delete: false,  // not deleted on disconnect
+                exclusive: false,    // other connections can reconnect to it
                 ..Default::default()
             },
             Default::default(),

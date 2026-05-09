@@ -56,6 +56,8 @@ pub async fn user_connected(
     let broker_id_inbound    = broker_id.clone();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
  
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+
     tokio::spawn(async move {
         while let Some(result) = ws_rx.next().await {
             if let Ok(msg) = result {
@@ -195,6 +197,9 @@ pub async fn user_connected(
     });
  
     tokio::spawn(async move {
+        // signal FIRST, before entering the recv loop
+        let _ = ready_tx.send(());
+        
         tokio::select! {
             _ = async {
                 while let Ok(message) = channel_rx.recv().await {
@@ -206,6 +211,7 @@ pub async fn user_connected(
             _ = shutdown_rx => {}
         }
     });
+    let _ = ready_rx.await;
 }
 
 pub async fn handle_ws_upgrade(

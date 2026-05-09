@@ -97,50 +97,36 @@ pub async fn user_connected(
                                 .unwrap_or(0)
                         };
  
-                        if receiver_count == 0 {
-                            // publish the event anyway — callee might be on another broker
-                            let event = WampEvent::from_publish(&publish, publication_id);
-                            let event_str = serde_json::to_string(&event).unwrap();
-                            publish_to_rabbitmq(&rabbit_pool, &target_channel, &event_str).await;
+                        // always publish the event to fanout — callee may be on another broker
+                        let event = WampEvent::from_publish(&publish, publication_id);
+                        let event_str = serde_json::to_string(&event).unwrap();
+                        publish_to_rabbitmq(&rabbit_pool, &target_channel, &event_str).await;
 
-                            // also publish miss notice — other brokers will increment the counter
-                            // only if ALL brokers miss will callee_offline fire
-                            let miss = CalleeMissNotice {
-                                correlation_id: publish.options.correlation_id.clone(),
-                                topic: target_channel.clone(),
-                                reply_to: publish.options.reply_to
-                                    .clone()
-                                    .or_else(|| Some(channel_name_inbound.clone())),
-                                broker_id: broker_id_inbound.clone(),
-                            };
-                            publish_callee_miss(&rabbit_pool, &miss).await;
+                        println!(
+                            "[ws] PUBLISH → '{}' pub_id={} receivers={}",
+                            target_channel, publication_id, receiver_count
+                        );
 
-                        } else {
-                            // local subscriber exists — publish and track pending call
-                            let event = WampEvent::from_publish(&publish, publication_id);
-                            let event_str = serde_json::to_string(&event).unwrap();
-                            publish_to_rabbitmq(&rabbit_pool, &target_channel, &event_str).await;
+                        // track as pending call if RPC-style and not a result
+                        if !is_result {
+                            let is_rpc_call = publish.kwargs
+                                .as_ref()
+                                .and_then(|kw| kw.get("function"))
+                                .is_some();
 
-                            if !is_result {
-                                let is_rpc_call = publish.kwargs
-                                    .as_ref()
-                                    .and_then(|kw| kw.get("function"))
-                                    .is_some();
-
-                                if is_rpc_call {
-                                    if let (Some(corr_id), Some(reply_to)) = (
-                                        publish.options.correlation_id.clone(),
-                                        publish.options.reply_to.clone(),
-                                    ) {
-                                        let pc = PendingCall {
-                                            correlation_id: corr_id.clone(),
-                                            reply_to,
-                                            callee_channel: target_channel.clone(),
-                                            caller_connection_id: connection_id.to_string(),
-                                            caller_channel: channel_name_inbound.clone(),
-                                        };
-                                        pending_call_insert(&redis_inbound, &pc).await;
-                                    }
+                            if is_rpc_call {
+                                if let (Some(corr_id), Some(reply_to)) = (
+                                    publish.options.correlation_id.clone(),
+                                    publish.options.reply_to.clone(),
+                                ) {
+                                    let pc = PendingCall {
+                                        correlation_id: corr_id.clone(),
+                                        reply_to,
+                                        callee_channel: target_channel.clone(),
+                                        caller_connection_id: connection_id.to_string(),
+                                        caller_channel: channel_name_inbound.clone(),
+                                    };
+                                    pending_call_insert(&redis_inbound, &pc).await;
                                 }
                             }
                         }

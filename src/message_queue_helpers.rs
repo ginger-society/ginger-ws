@@ -50,6 +50,7 @@ pub async fn process_rabbitmq_messages(
         match delivery {
             Ok(delivery) => {
                 let message = String::from_utf8_lossy(&delivery.data).to_string();
+                println!("[rabbitmq] RAW received on queue: {}", message); 
 
                 if let Ok(rabbit_message) = serde_json::from_str::<RabbitMessage>(&message) {
                     let channels_lock = channels.lock().await;

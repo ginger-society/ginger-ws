@@ -28,8 +28,7 @@ use crate::{
     auth_helpers::CalleeMissNotice,
     requests::WampCalleeOffline,
     shared::{
-        clear_miss_count, increment_miss_count, live_broker_count, Channels, RabbitPoolRef,
-        RedisPool, publish_to_rabbitmq,
+        Channels, MISS_COUNT_TTL_SECS, RabbitPoolRef, RedisPool, clear_miss_count, increment_miss_count, live_broker_count, publish_to_rabbitmq
     },
 };
 
@@ -103,13 +102,11 @@ async fn handle_miss_notices(
         }
     }
 }
-
 async fn process_miss_notice(
     notice: CalleeMissNotice,
     redis: &RedisPool,
     rabbit_pool: &RabbitPoolRef,
 ) {
-    // Plain broadcast with no RPC context — nothing to report back.
     let corr_id = match &notice.correlation_id {
         Some(id) => id.clone(),
         None => {
@@ -132,10 +129,34 @@ async fn process_miss_notice(
         }
     };
 
-    // How many brokers are alive right now?
-    let broker_count = live_broker_count(redis).await;
+    // ── Deduplicate: only count each broker's miss ONCE ──────────────────────
+    // Because __callee_miss__ is on the fanout exchange, every broker receives
+    // every notice. We must count distinct *reporting brokers*, not deliveries.
+    let dedup_key = format!("callee_miss_seen:{}:{}", corr_id, notice.broker_id);
+    let mut conn = (**redis).clone();
 
-    // Atomically record this broker's miss.
+    // SET NX — only succeeds for the first broker that processes this notice
+    let is_new: bool = redis::cmd("SET")
+        .arg(&dedup_key)
+        .arg("1")
+        .arg("NX")
+        .arg("EX")
+        .arg(MISS_COUNT_TTL_SECS)  // re-use same TTL
+        .query_async(&mut conn)
+        .await
+        .unwrap_or(false);
+
+    if !is_new {
+        // Another broker already counted this (broker_id, corr_id) pair
+        println!(
+            "[miss-consumer] duplicate miss notice for corr={} broker={} — skipping",
+            corr_id, notice.broker_id
+        );
+        return;
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
+    let broker_count = live_broker_count(redis).await;
     let miss_count = increment_miss_count(redis, &corr_id).await;
 
     println!(
@@ -144,7 +165,6 @@ async fn process_miss_notice(
     );
 
     if miss_count >= broker_count {
-        // Every live broker reported a miss — callee is truly offline.
         clear_miss_count(redis, &corr_id).await;
 
         let offline = WampCalleeOffline {
@@ -166,5 +186,4 @@ async fn process_miss_notice(
             reply_to, corr_id
         );
     }
-    // else: still waiting for other brokers to report — do nothing.
 }

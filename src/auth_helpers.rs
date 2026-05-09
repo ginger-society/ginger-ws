@@ -98,10 +98,13 @@ pub async fn user_connected(
                         };
  
                         if receiver_count == 0 {
-                            // ── NEW: publish a miss notice instead of firing   ──
-                            // callee_offline immediately.  The miss consumer will
-                            // aggregate across all broker instances and only fire
-                            // the error when every broker reports a miss.
+                            // publish the event anyway — callee might be on another broker
+                            let event = WampEvent::from_publish(&publish, publication_id);
+                            let event_str = serde_json::to_string(&event).unwrap();
+                            publish_to_rabbitmq(&rabbit_pool, &target_channel, &event_str).await;
+
+                            // also publish miss notice — other brokers will increment the counter
+                            // only if ALL brokers miss will callee_offline fire
                             let miss = CalleeMissNotice {
                                 correlation_id: publish.options.correlation_id.clone(),
                                 topic: target_channel.clone(),
@@ -110,33 +113,21 @@ pub async fn user_connected(
                                     .or_else(|| Some(channel_name_inbound.clone())),
                                 broker_id: broker_id_inbound.clone(),
                             };
- 
                             publish_callee_miss(&rabbit_pool, &miss).await;
- 
-                            println!(
-                                "[ws] no local subs on '{}' — miss notice published (broker={})",
-                                target_channel, broker_id_inbound
-                            );
+
                         } else {
+                            // local subscriber exists — publish and track pending call
                             let event = WampEvent::from_publish(&publish, publication_id);
                             let event_str = serde_json::to_string(&event).unwrap();
                             publish_to_rabbitmq(&rabbit_pool, &target_channel, &event_str).await;
- 
-                            println!(
-                                "[ws] PUBLISH → '{}' pub_id={} receivers={}",
-                                target_channel, publication_id, receiver_count
-                            );
- 
-                            // track as pending call if RPC-style and not a result
+
                             if !is_result {
                                 let is_rpc_call = publish.kwargs
                                     .as_ref()
                                     .and_then(|kw| kw.get("function"))
                                     .is_some();
 
-
                                 if is_rpc_call {
-
                                     if let (Some(corr_id), Some(reply_to)) = (
                                         publish.options.correlation_id.clone(),
                                         publish.options.reply_to.clone(),
@@ -150,10 +141,7 @@ pub async fn user_connected(
                                         };
                                         pending_call_insert(&redis_inbound, &pc).await;
                                     }
-
                                 }
-
-                                
                             }
                         }
  

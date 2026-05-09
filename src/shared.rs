@@ -129,7 +129,7 @@ pub async fn connect_rabbitmq_publisher() -> Result<RabbitChannel, lapin::Error>
 
 /// Consumer connection — exclusive queue per broker instance
 /// Every instance gets its own queue → fanout delivers to ALL instances
-pub async fn connect_rabbitmq_consumer() -> Result<(RabbitChannel, String), lapin::Error> {
+pub async fn connect_rabbitmq_consumer(broker_id: String) -> Result<(RabbitChannel, String), lapin::Error> {
     let addr = std::env::var("AMPQ_URI")
         .unwrap_or_else(|_| "amqp://user:password@localhost:5672/%2f".to_string());
 
@@ -152,8 +152,6 @@ pub async fn connect_rabbitmq_consumer() -> Result<(RabbitChannel, String), lapi
     // exclusive auto-named queue — unique per broker instance
     // auto_delete: true  → deleted when this connection closes
     // exclusive: true    → only this connection can consume from it
-    let broker_id = std::env::var("BROKER_ID")
-        .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
 
     let queue_name = format!("broker_{}", broker_id);
 

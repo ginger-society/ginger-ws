@@ -7,9 +7,9 @@ use tokio::time::{sleep, Duration};
 use crate::requests::RabbitMessage;
 use crate::shared::{connect_rabbitmq_consumer, Channels};
 
-pub async fn consume_messages(channels: Channels) {
+pub async fn consume_messages(channels: Channels, broker_id: String) {
     loop {
-        match connect_rabbitmq_consumer().await {
+        match connect_rabbitmq_consumer(broker_id.clone()).await {
             Ok((rabbit_channel, queue_name)) => {
                 println!("[rabbitmq] consumer started on queue {}", queue_name);
                 if let Err(e) = process_rabbitmq_messages(

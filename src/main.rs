@@ -94,8 +94,9 @@ async fn main() {
     // start RabbitMQ consumer
     // exclusive queue per instance, fanout delivers to all instances
     let channels_mq = channels.clone();
+    let broker_id_mq = broker_id.clone();
     tokio::spawn(async move {
-        consume_messages(channels_mq).await;
+        consume_messages(channels_mq, broker_id_mq).await;
     });
 
     start_miss_consumer(channels.clone(), redis.clone(), rabbit_pool.clone()).await;

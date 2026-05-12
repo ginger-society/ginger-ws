@@ -76,7 +76,7 @@
 <div class="row">
   <div class="field-row">
     <span class="field-label">WebSocket URL (channel name is the last path segment)</span>
-    <input id="url" type="text" value="ws://localhost:3030/notification/ws/my-channel" />
+    <input id="url" type="text" value="wss://api.gingersociety.org/notification/ws/my-channel" />
   </div>
   <div class="field-row">
     <span class="field-label">Auth token (appended as ?token=…)</span>
@@ -163,11 +163,11 @@
     </div>
   </div>
   <div class="field-row">
-    <span class="field-label">args (JSON object — extra params for the function)</span>
-    <textarea id="rpc-args" placeholder='{"message_id":"msg-42","from_user":7}' oninput="updateRpcPreview()"></textarea>
+    <span class="field-label">args (JSON object — params for the function)</span>
+    <textarea id="rpc-args" placeholder='{"package":"certbot"}' oninput="updateRpcPreview()"></textarea>
   </div>
   <div class="field-row">
-    <span class="field-label">Payload preview (kwargs that will be sent)</span>
+    <span class="field-label">Payload preview</span>
     <div class="preview-box" id="rpc-preview">Fill in the fields above to preview the payload.</div>
   </div>
   <div style="display:flex; gap:8px; margin-top:4px;">
@@ -217,7 +217,8 @@
 
   function log(text, type = 'info') {
     const box = document.getElementById('log');
-    const t = new Date().toLocaleTimeString();
+    const now = new Date();
+    const t = now.toLocaleTimeString() + '.' + String(now.getMilliseconds()).padStart(3, '0');
     const div = document.createElement('div');
     div.className = `msg ${type}`;
     div.textContent = `[${t}] ${text}`;
@@ -261,9 +262,9 @@
               log(`← BROKER: callee_disconnected  corr=${obj.correlation_id || ''}`, 'wamp-err');
               log(`   The callee disconnected while your call was in flight.`, 'wamp-err');
               break;
-            case 'call_expired':
-              log(`← BROKER: call_expired  corr=${obj.correlation_id || ''}`, 'wamp-err');
-              log(`   The callee never responded within the TTL window (5 min).`, 'wamp-err');
+            case 'callee_timeout':
+              log(`← BROKER: callee_timeout  corr=${obj.correlation_id || ''}`, 'wamp-err');
+              log(`   The callee never responded within the TTL window.`, 'wamp-err');
               break;
             default:
               log(`← BROKER ERROR: ${obj.error}  corr=${obj.correlation_id || ''}`, 'error');
@@ -278,18 +279,29 @@
 
           if (isResult) {
             log(`← RESULT [36]  topic=${obj.details?.topic}  corr=${kw.correlation_id || ''}`, 'resolved');
-            log(`   fn: ${kw.function || '(none)'}`, 'resolved');
-            if (kw.result) log(`   result: ${JSON.stringify(kw.result)}`, 'resolved');
+
+            // extract result payload — strip metadata fields
+            const metaFields = ['is_result', 'is_error', 'correlation_id', 'reply_to'];
+            const resultPayload = Object.fromEntries(
+              Object.entries(kw).filter(([k]) => !metaFields.includes(k))
+            );
+
+            if (Object.keys(resultPayload).length > 0) {
+              log(`   result: ${JSON.stringify(resultPayload)}`, 'resolved');
+            }
+
+            if (kw.is_error) {
+              log(`   ⚠ callee returned an error`, 'wamp-err');
+            }
           } else {
             log(`← EVENT [36]  topic=${obj.details?.topic}  pub_id=${obj.publication_id}`, 'wamp');
-            if (obj.args)   log(`   args:     ${JSON.stringify(obj.args)}`, 'wamp');
-            if (kw.function)          log(`   function: ${kw.function}`, 'wamp');
-            if (kw.correlation_id)    log(`   corr_id:  ${kw.correlation_id}`, 'wamp');
-            if (kw.reply_to)          log(`   reply_to: ${kw.reply_to}`, 'wamp');
-            if (Object.keys(kw).filter(k => !['function','correlation_id','reply_to','is_result'].includes(k)).length > 0) {
-              const extra = Object.fromEntries(
-                Object.entries(kw).filter(([k]) => !['function','correlation_id','reply_to','is_result'].includes(k))
-              );
+            if (obj.args)                log(`   args:     ${JSON.stringify(obj.args)}`, 'wamp');
+            if (kw.function)             log(`   function: ${kw.function}`, 'wamp');
+            if (kw.correlation_id)       log(`   corr_id:  ${kw.correlation_id}`, 'wamp');
+            if (kw.reply_to)             log(`   reply_to: ${kw.reply_to}`, 'wamp');
+            const extraKeys = Object.keys(kw).filter(k => !['function','correlation_id','reply_to','is_result'].includes(k));
+            if (extraKeys.length > 0) {
+              const extra = Object.fromEntries(extraKeys.map(k => [k, kw[k]]));
               log(`   extra:    ${JSON.stringify(extra)}`, 'wamp');
             }
           }
@@ -370,82 +382,6 @@
     const preview = document.getElementById('rpc-preview');
     const fn      = document.getElementById('rpc-fn').value.trim();
     const replyTo = document.getElementById('rpc-reply').value.trim();
-    let extra = {};
-    try {
-      const v = document.getElementById('rpc-args').value.trim();
-      if (v) extra = JSON.parse(v);
-      preview.style.color = '#8b949e';
-    } catch {
-      preview.style.color = '#f85149';
-      preview.textContent = 'args: invalid JSON';
-      return;
-    }
-    const payload = {
-      function: fn || '(not set)',
-      correlation_id: 'corr-<auto>',
-      reply_to: replyTo || '(not set)',
-      ...extra,
-    };
-    preview.textContent = JSON.stringify(payload, null, 2);
-  }
-  function sendRpcCall() {
-    if (!guardSend()) return;
-    const topic   = document.getElementById('rpc-topic').value.trim();
-    const replyTo = document.getElementById('rpc-reply').value.trim();
-    const fn      = document.getElementById('rpc-fn').value.trim();
-    let fnArgs = {};
-    try {
-      const v = document.getElementById('rpc-args').value.trim();
-      if (v) fnArgs = JSON.parse(v);
-    } catch { log('args: invalid JSON', 'error'); return; }
-
-    if (!topic) { log('Channel (callee) is required', 'error'); return; }
-
-    const corrId = `corr-${Date.now()}`;
-
-    // kwargs = routing metadata only
-    const kwargs = {
-      ...(fn      ? { function: fn }      : {}),
-      correlation_id: corrId,
-      ...(replyTo ? { reply_to: replyTo } : {}),
-    };
-
-    // args = the actual function arguments, as an array wrapping the object
-    const args = Object.keys(fnArgs).length > 0 ? [fnArgs] : [];
-
-    const msg = {
-      message_type: 16,
-      request_id: ++reqId,
-      options: { acknowledge: true, reply_to: replyTo, correlation_id: corrId },
-      topic,
-      args,     // ← pure function args
-      kwargs,   // ← routing metadata only
-    };
-    ws.send(JSON.stringify(msg));
-    log(`→ RPC CALL [16]  channel=${topic}  fn=${fn || '(none)'}  corr=${corrId}`, 'wamp');
-    log(`   args:   ${JSON.stringify(args)}`, 'wamp');
-    log(`   kwargs: ${JSON.stringify(kwargs)}`, 'wamp');
-    if (replyTo) log(`   result expected on: ${replyTo}`, 'wamp');
-
-    document.getElementById('res-corr').value  = corrId;
-    document.getElementById('res-reply').value = replyTo;
-    updateResPreview();
-  }
-
-  function fillRpcExample() {
-    document.getElementById('rpc-topic').value = 'my-procedure';
-    document.getElementById('rpc-fn').value    = 'handle_new_message';
-    document.getElementById('rpc-reply').value = 'my-result';
-    document.getElementById('rpc-args').value  = JSON.stringify({"message_id":"msg-42","from_user":7}, null, 2);
-    updateRpcPreview();
-  }
-
-  // ── WAMP RPC result ────────────────────────────────────────────────────────
-
-  function updateRpcPreview() {
-    const preview = document.getElementById('rpc-preview');
-    const fn      = document.getElementById('rpc-fn').value.trim();
-    const replyTo = document.getElementById('rpc-reply').value.trim();
     let fnArgs = {};
     try {
       const v = document.getElementById('rpc-args').value.trim();
@@ -467,6 +403,81 @@
     preview.textContent = JSON.stringify(payload, null, 2);
   }
 
+  function sendRpcCall() {
+    if (!guardSend()) return;
+    const topic   = document.getElementById('rpc-topic').value.trim();
+    const replyTo = document.getElementById('rpc-reply').value.trim();
+    const fn      = document.getElementById('rpc-fn').value.trim();
+    let fnArgs = {};
+    try {
+      const v = document.getElementById('rpc-args').value.trim();
+      if (v) fnArgs = JSON.parse(v);
+    } catch { log('args: invalid JSON', 'error'); return; }
+
+    if (!topic) { log('Channel (callee) is required', 'error'); return; }
+
+    const corrId = `corr-${Date.now()}`;
+
+    const kwargs = {
+      ...(fn      ? { function: fn }      : {}),
+      correlation_id: corrId,
+      ...(replyTo ? { reply_to: replyTo } : {}),
+    };
+
+    const args = Object.keys(fnArgs).length > 0 ? [fnArgs] : [];
+
+    const msg = {
+      message_type: 16,
+      request_id: ++reqId,
+      options: { acknowledge: true, reply_to: replyTo, correlation_id: corrId },
+      topic,
+      args,
+      kwargs,
+    };
+    ws.send(JSON.stringify(msg));
+    log(`→ RPC CALL [16]  channel=${topic}  fn=${fn || '(none)'}  corr=${corrId}`, 'wamp');
+    log(`   args:   ${JSON.stringify(args)}`, 'wamp');
+    log(`   kwargs: ${JSON.stringify(kwargs)}`, 'wamp');
+    if (replyTo) log(`   result expected on: ${replyTo}`, 'wamp');
+
+    document.getElementById('res-corr').value  = corrId;
+    document.getElementById('res-reply').value = replyTo;
+    updateResPreview();
+  }
+
+  function fillRpcExample() {
+    document.getElementById('rpc-topic').value = 'ginger_infra_<realm>';
+    document.getElementById('rpc-fn').value    = 'snap_install';
+    document.getElementById('rpc-reply').value = 'my-channel';
+    document.getElementById('rpc-args').value  = JSON.stringify({"package": "certbot"}, null, 2);
+    updateRpcPreview();
+  }
+
+  // ── WAMP RPC result ────────────────────────────────────────────────────────
+
+  function updateResPreview() {
+    const preview = document.getElementById('res-preview');
+    const replyTo = document.getElementById('res-reply').value.trim();
+    const corrId  = document.getElementById('res-corr').value.trim();
+    let result = {};
+    try {
+      const v = document.getElementById('res-payload').value.trim();
+      if (v) result = JSON.parse(v);
+      preview.style.color = '#8b949e';
+    } catch {
+      preview.style.color = '#f85149';
+      preview.textContent = 'result payload: invalid JSON';
+      return;
+    }
+    const payload = {
+      is_result: true,
+      correlation_id: corrId || '(not set)',
+      reply_to: replyTo || '(not set)',
+      ...result,
+    };
+    preview.textContent = JSON.stringify(payload, null, 2);
+  }
+
   function sendRpcResult() {
     if (!guardSend()) return;
     const replyTo = document.getElementById('res-reply').value.trim();
@@ -484,13 +495,13 @@
       is_result: true,
       correlation_id: corrId,
       reply_to: replyTo,
-      result,
+      ...result,
     };
     const msg = {
       message_type: 16,
       request_id: ++reqId,
-      options: { acknowledge: true, reply_to: replyTo, correlation_id: corrId },
-      topic: replyTo,   // send directly to caller's channel
+      options: { acknowledge: true, correlation_id: corrId },
+      topic: replyTo,
       args: [],
       kwargs,
     };
@@ -500,7 +511,7 @@
   }
 
   function fillResExample() {
-    document.getElementById('res-reply').value   = 'my-result';
+    document.getElementById('res-reply').value   = 'my-channel';
     document.getElementById('res-corr').value    = `corr-${Date.now()}`;
     document.getElementById('res-payload').value = JSON.stringify({"status":"ok","data":{"cloned":true}}, null, 2);
     updateResPreview();

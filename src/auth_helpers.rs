@@ -237,6 +237,10 @@ pub async fn user_authenticated(
             println!("Authenticated API user: {:?}", token_data.claims.sub);
             return Ok((ws, channel_name, channels, connections, redis, redis_pubsub, rabbit_pool, broker_id));
         }
+        if let Ok(token_data) = decode::<ISCClaims>(&token, &decoding_key, &validation) {
+            println!("Authenticated Service: {:?}", token_data.claims.sub);
+            return Ok((ws, channel_name, channels, connections, redis, redis_pubsub, rabbit_pool, broker_id));
+        }
  
         println!("Unauthorized access attempt");
         Err(warp::reject::custom(JWTError))

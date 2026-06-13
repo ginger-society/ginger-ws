@@ -40,7 +40,7 @@ pub type Channels    = Arc<Mutex<HashMap<String, Channel>>>;
 pub type Connections = Arc<Mutex<HashMap<Uuid, WsConnection>>>;
 pub type RedisPool   = Arc<redis::aio::ConnectionManager>;
 
-pub const PENDING_CALL_TTL_SECS: u64 = 60;
+pub const PENDING_CALL_TTL_SECS: u64 = 600; // 10 minutes
 const PENDING_KEY: &str = "pending_call:";
 const PENDING_INDEX_KEY: &str = "pending_call_index:";
 pub const BROKER_HEARTBEAT_KEY: &str = "broker:heartbeat:";
